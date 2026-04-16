@@ -1,0 +1,50 @@
+version: "3.9"
+
+# ── Phase 0 stack ────────────────────────────────────────────────────────────
+# Two services: market_sim (price feed) + fund (trading loop).
+# In Phase 2, point MARKET_SIM_URL at Alpaca and remove the market_sim service.
+
+services:
+
+  market_sim:
+    build:
+      context: ./market_sim
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  fund:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      market_sim:
+        condition: service_healthy
+    environment:
+      # Put your real key in .env — never commit it
+      ANTHROPIC_API_KEY:     ${ANTHROPIC_API_KEY}
+      MARKET_SIM_URL:        http://market_sim:8001
+      DB_PATH:               /data/fund.db
+      ASSETS:                SYN-A,SYN-B,SYN-C
+      MOMENTUM_THRESHOLD:    0.03
+      CONFIDENCE_THRESHOLD:  0.70
+      MAX_POSITION_USD:      1000.0
+      CHECK_INTERVAL_SECONDS: 60
+      MANAGER_MODEL:         anthropic/claude-haiku-4-5-20251001
+      SPECIALIST_MODEL:      anthropic/claude-haiku-4-5-20251001
+      LOG_LEVEL:             INFO
+    volumes:
+      - fund_data:/data
+    restart: unless-stopped
+    command: python run.py
+
+volumes:
+  fund_data:
+    # Persists the SQLite DB (portfolio, orders, decision log) across restarts
