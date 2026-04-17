@@ -1,39 +1,64 @@
 """
-Fund configuration.  All values are read from environment / .env file.
-Change trading parameters here without touching agent code.
+Fund configuration.
+Only values that should not change at runtime live here.
+Runtime-mutable knobs (thresholds, active assets, halt flag) live in the
+`control` table in SQLite and are read fresh on every cycle.
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
-    # ── API keys ──────────────────────────────────────────────────────────────
+    # ── API ───────────────────────────────────────────────────────────────────
     anthropic_api_key: str = ""
 
-    # ── Models ────────────────────────────────────────────────────────────────
-    #  Manager uses a slightly stronger model; specialists use Haiku for cost.
-    manager_model: str    = "anthropic/claude-haiku-4-5-20251001"
-    specialist_model: str = "anthropic/claude-haiku-4-5-20251001"
+    # ── Per-agent models ──────────────────────────────────────────────────────
+    # Manager synthesises — use Sonnet. Specialists are narrow — Haiku is plenty.
+    manager_model:      str = "anthropic/claude-sonnet-4-6"
+    research_model:     str = "anthropic/claude-haiku-4-5-20251001"
+    risk_model:         str = "anthropic/claude-haiku-4-5-20251001"
+    sentiment_model:    str = "anthropic/claude-haiku-4-5-20251001"
+    execution_model:    str = "anthropic/claude-haiku-4-5-20251001"
+    accountant_model:   str = "anthropic/claude-haiku-4-5-20251001"
+    reflection_model:   str = "anthropic/claude-haiku-4-5-20251001"
 
-    # ── Infrastructure ────────────────────────────────────────────────────────
+    # ── Infra ─────────────────────────────────────────────────────────────────
     market_sim_url: str = "http://localhost:8001"
-    db_path: str        = "data/fund.db"
+    db_path:        str = "data/fund.db"
 
-    # ── Trading universe ──────────────────────────────────────────────────────
-    assets: List[str] = ["SYN-A", "SYN-B", "SYN-C"]   # Phase 0: 3 assets
+    # ── Defaults seeded into the control table on first start ─────────────────
+    default_assets_str:           str   = "SYN-A,SYN-B,SYN-C"
+    default_momentum_threshold:   float = 0.030
+    default_confidence_threshold: float = 0.70
+    default_max_position_usd:     float = 1000.0
+    default_check_interval:       int   = 60
+    default_cooldown_minutes:     int   = 15
 
-    # ── Signal thresholds ─────────────────────────────────────────────────────
-    momentum_threshold: float  = 0.030   # 3% price move triggers Research hire
-    confidence_threshold: float = 0.70   # min Research confidence to trade
-    max_position_usd: float    = 1000.0  # max $ per trade
+    # ── Budget caps (hard limits, not runtime-mutable for safety) ─────────────
+    # Start at $1/week for testing.  Raise once Phase 1 is proven stable.
+    weekly_budget_total_usd:      float = 1.00
+    weekly_budget_research_usd:   float = 0.40
+    weekly_budget_risk_usd:       float = 0.20
+    weekly_budget_sentiment_usd:  float = 0.15
+    weekly_budget_execution_usd:  float = 0.10
+    weekly_budget_accountant_usd: float = 0.05
+    weekly_budget_reflection_usd: float = 0.10
 
-    # ── Budget ────────────────────────────────────────────────────────────────
-    monthly_budget_usd: float = 50.0     # hard monthly cap on agent API costs
+    # Hard per-cycle safety: don't let a rogue cycle drain the week
+    max_cycle_spend_usd: float = 0.10
 
-    # ── Loop ──────────────────────────────────────────────────────────────────
-    check_interval_seconds: int = 60     # how often to scan for signals
+    # ── HTTP control port (for /stop and dashboard) ───────────────────────────
+    control_port: int = 8002
+
+    @property
+    def default_assets(self) -> List[str]:
+        return [a.strip() for a in self.default_assets_str.split(",")]
 
 
 settings = Settings()

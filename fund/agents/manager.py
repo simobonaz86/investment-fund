@@ -1,48 +1,39 @@
 """
-Investment Manager Agent
-The orchestrator.  Monitors portfolio state, evaluates research verdicts,
-and decides whether to hire the Execution Agent.
-Never trades without Research backing at or above the confidence threshold.
+Investment Manager Agent.
+Runs on Sonnet 4.6 — synthesising across specialists benefits from the extra reasoning.
 """
-import os
 from crewai import Agent, LLM
-from fund.tools.market import calculate_indicators
+from fund.config import settings
 from fund.tools.broker import get_portfolio_state
+from fund.tools.market import calculate_indicators
 
 
 def build_investment_manager() -> Agent:
-    llm = LLM(
-        model=os.getenv("MANAGER_MODEL", "anthropic/claude-haiku-4-5-20251001"),
-        api_key=os.getenv("ANTHROPIC_API_KEY", ""),
-    )
-
-    confidence_threshold = float(os.getenv("CONFIDENCE_THRESHOLD", "0.70"))
-    max_position_usd     = float(os.getenv("MAX_POSITION_USD",      "1000.0"))
+    llm = LLM(model=settings.manager_model, api_key=settings.anthropic_api_key)
 
     return Agent(
         role="Investment Manager",
         goal=(
-            "Protect the fund's capital while capturing high-conviction opportunities. "
-            "Only approve trades where the Research Analyst's confidence is at or above "
-            f"{confidence_threshold:.0%}. "
-            f"Never risk more than ${max_position_usd:.0f} per trade. "
-            "Explain every decision with a one-sentence reason."
+            "Protect capital while capturing high-conviction opportunities. "
+            "Decide which specialists to hire for each signal, then synthesise their "
+            "outputs into a trade decision. Be the Board's fiduciary."
         ),
         backstory=(
-            "You are the Investment Manager of a small autonomous fund. "
-            "You are the senior decision-maker: you receive research verdicts, check portfolio "
-            "exposure, and decide whether to trade. "
-            "Your core rule is non-negotiable: no trade without Research Analyst approval "
-            f"at confidence >= {confidence_threshold:.0%}. "
-            "A HOLD verdict or confidence below threshold = no trade, period. "
-            "You size positions conservatively — never exceeding the per-trade cap. "
-            "You always return your decision in exactly the structured format you are asked for — "
-            "TRADE, DIRECTION, SIZE_USD, REASON — because the system parses it programmatically. "
+            "You are the senior Investment Manager of an autonomous fund. You have "
+            "two distinct roles at different points in a cycle:\n"
+            "  1. HIRING  — given a signal, decide which specialists to engage. "
+            "     Research is almost always required. Risk is required when the "
+            "     portfolio already has exposure to the asset or is concentrated. "
+            "     Sentiment is optional — only hire if news-driven context matters.\n"
+            "  2. DECIDING — given specialist reports, decide whether to trade, "
+            "     the direction, and the size. You are conservative: HOLD is always "
+            "     a valid answer.\n"
+            "You fill Pydantic schemas exactly — no prose outside the schema. "
             "You are the guardian of the Board's capital. When in doubt, do nothing."
         ),
         tools=[calculate_indicators, get_portfolio_state],
         llm=llm,
         verbose=True,
-        allow_delegation=False,   # Manager's decision logic is in task descriptions
+        allow_delegation=False,
         max_iter=4,
     )

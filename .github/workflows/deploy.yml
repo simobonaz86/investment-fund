@@ -1,0 +1,68 @@
+name: Deploy to Sentinel
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Tailscale (connects runner to Sentinel's private network) ────────────
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id:     ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret:        ${{ secrets.TS_OAUTH_SECRET }}
+          tags:                tag:ci
+
+      # ── Deploy ───────────────────────────────────────────────────────────────
+      - name: Deploy to Sentinel
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host:        ${{ secrets.SENTINEL_HOST }}   # 100.102.177.53
+          username:    ${{ secrets.SENTINEL_USER }}   # root
+          key:         ${{ secrets.SENTINEL_SSH_KEY }}
+          script: |
+            set -e
+            APP_DIR=/opt/investment_fund
+
+            echo "==> Pulling latest code"
+            if [ -d "$APP_DIR/.git" ]; then
+              cd $APP_DIR && git pull origin main
+            else
+              git clone https://github.com/${{ github.repository }}.git $APP_DIR
+              cd $APP_DIR
+            fi
+
+            echo "==> Writing .env"
+            cat > $APP_DIR/.env << 'ENVEOF'
+            ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+            MARKET_SIM_URL=http://market_sim:8001
+            DB_PATH=/data/fund.db
+            ASSETS=SYN-A,SYN-B,SYN-C
+            MOMENTUM_THRESHOLD=0.03
+            CONFIDENCE_THRESHOLD=0.70
+            MAX_POSITION_USD=1000.0
+            CHECK_INTERVAL_SECONDS=60
+            MANAGER_MODEL=anthropic/claude-haiku-4-5-20251001
+            SPECIALIST_MODEL=anthropic/claude-haiku-4-5-20251001
+            LOG_LEVEL=INFO
+            ENVEOF
+
+            echo "==> Building and starting containers"
+            cd $APP_DIR
+            docker compose pull --quiet 2>/dev/null || true
+            docker compose up -d --build --remove-orphans
+
+            echo "==> Waiting for market_sim health check"
+            sleep 8
+            docker compose ps
+
+            echo "==> Deploy complete"

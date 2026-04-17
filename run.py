@@ -1,44 +1,63 @@
 #!/usr/bin/env python3
 """
-Investment Fund — Phase 0 entry point.
+Investment Fund — Phase 1 entry point.
 
-Start order:
-  Terminal 1:  cd market_sim && python main.py          (market simulator)
-  Terminal 2:  python run.py                             (trading loop)
+Runs two things side-by-side in one container:
+  • Trading loop       (background thread)
+  • Control API server (main thread, uvicorn)
 
-Or with Docker:
-  docker compose up
+The control API owns the lifecycle of the app — when it exits, the container
+exits, which makes `docker compose restart` and Ctrl+C behave predictably.
 """
 import logging
 import os
+import threading
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-# CrewAI is verbose; silence its internal chatter below WARNING to keep
-# the trading log readable.  Set LOG_LEVEL=DEBUG to see everything.
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     datefmt="%H:%M:%S",
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("opentelemetry").setLevel(logging.WARNING)
-logging.getLogger("chromadb").setLevel(logging.WARNING)
+for noisy in ("httpx", "httpcore", "opentelemetry", "chromadb", "LiteLLM", "uvicorn.access"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# ── Sanity check ──────────────────────────────────────────────────────────────
 if not os.getenv("ANTHROPIC_API_KEY"):
-    raise RuntimeError(
-        "ANTHROPIC_API_KEY is not set. "
-        "Copy .env.example → .env and add your key."
-    )
+    raise RuntimeError("ANTHROPIC_API_KEY is not set.")
 
-# ── Run ───────────────────────────────────────────────────────────────────────
-from fund.crew import run_loop
+log = logging.getLogger("run")
+
+# Import after env + logging are set up
+from fund.config      import settings
+from fund.database    import init_db
+from fund.crew        import run_loop
+from fund.control_api import app as control_app
+
+
+def _start_loop():
+    try:
+        run_loop()
+    except Exception:
+        log.exception("trading loop crashed")
+
 
 if __name__ == "__main__":
-    run_loop()
+    init_db()
+
+    # Trading loop runs in a background thread; daemon=True so it dies with the process.
+    t = threading.Thread(target=_start_loop, name="trading-loop", daemon=True)
+    t.start()
+    log.info("Trading loop thread started")
+
+    # Control API is the foreground process
+    import uvicorn
+    uvicorn.run(
+        control_app,
+        host="0.0.0.0",
+        port=settings.control_port,
+        log_level=LOG_LEVEL.lower(),
+    )
