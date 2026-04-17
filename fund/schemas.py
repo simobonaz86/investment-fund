@@ -45,3 +45,41 @@ class ExecutionResult(BaseModel):
 class ReflectionNote(BaseModel):
     outcome: Literal["win", "loss", "breakeven", "pending"]
     note:    str = Field(max_length=500)
+
+
+# ── Phase 2.1: Governance schemas ─────────────────────────────────────────────
+
+class CEOHiringPlan(BaseModel):
+    """CEO's hiring decision — who to bring in and on what model tier."""
+    hire_research:  bool
+    hire_risk:      bool
+    hire_sentiment: bool = False
+    # Model tier per hire — CEO's authority (weekly cap is the check)
+    research_tier:  Literal["haiku", "sonnet", "opus"] = "haiku"
+    risk_tier:      Literal["haiku", "sonnet", "opus"] = "haiku"
+    sentiment_tier: Literal["haiku", "sonnet", "opus"] = "haiku"
+    reason:         str = Field(max_length=500)
+
+
+class KevinReview(BaseModel):
+    """
+    Auditor Kevin's review of a CEO decision before execution.
+
+    Actions:
+      • pass        — no concern, trade proceeds
+      • flag_yellow — info-level concern, trade proceeds, Board informed
+      • flag_red    — serious concern, trade proceeds, Board alerted for review
+      • block       — trade halts until Board approves via dashboard
+    """
+    action:  Literal["pass", "flag_yellow", "flag_red", "block"]
+    reason:  str = Field(max_length=500)
+    concern_pattern: str | None = Field(default=None, max_length=200)
+
+
+class KevinWeeklyAudit(BaseModel):
+    """Kevin's weekly audit posted to the Principals' room."""
+    grade:      Literal["A", "B", "C", "D", "F"]
+    wins:       list[str] = Field(default_factory=list, max_length=5)
+    concerns:   list[str] = Field(default_factory=list, max_length=5)
+    pattern_flags:     list[str] = Field(default_factory=list, max_length=5)
+    recommendation:    str = Field(max_length=600)

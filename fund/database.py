@@ -163,6 +163,75 @@ def init_db() -> None:
                 total_equity REAL NOT NULL,
                 snapshot_at  TEXT NOT NULL
             );
+
+            -- ═══════════════════════════════════════════════════════════════
+            -- Phase 2.1: Governance tables
+            -- ═══════════════════════════════════════════════════════════════
+
+            -- Principals' room — CEO / Kevin / HR chat, Board observes only
+            CREATE TABLE IF NOT EXISTS principals_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender     TEXT NOT NULL,      -- 'ceo' | 'kevin' | 'hr'
+                kind       TEXT NOT NULL,      -- 'chat' | 'weekly_audit' | 'weekly_hr' | 'flag' | 'escalation'
+                ref_id     INTEGER,            -- optional link (e.g. decision_id)
+                body       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_principals_created
+                ON principals_messages(created_at);
+
+            -- Kevin's flags on CEO decisions
+            CREATE TABLE IF NOT EXISTS kevin_flags (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id  INTEGER NOT NULL,
+                severity     TEXT NOT NULL,    -- 'yellow' | 'red'
+                reason       TEXT NOT NULL,
+                pattern      TEXT,
+                acknowledged INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_kevin_flags_decision
+                ON kevin_flags(decision_id);
+
+            -- Trades Kevin blocked, pending Board approval via dashboard
+            CREATE TABLE IF NOT EXISTS pending_approvals (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id  INTEGER NOT NULL,
+                symbol       TEXT NOT NULL,
+                direction    TEXT NOT NULL,
+                size_usd     REAL NOT NULL,
+                ceo_reason   TEXT NOT NULL,
+                kevin_reason TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|rejected
+                decided_by   TEXT,
+                decided_at   TEXT,
+                created_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_status
+                ON pending_approvals(status);
+
+            -- Board-only alerts: high-priority notices from Kevin
+            CREATE TABLE IF NOT EXISTS board_alerts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                priority   TEXT NOT NULL,      -- 'info' | 'high' | 'critical'
+                subject    TEXT NOT NULL,
+                body       TEXT NOT NULL,
+                source     TEXT NOT NULL,      -- 'kevin' | 'hr' | 'system'
+                ref_id     INTEGER,
+                read_at    TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            -- Agent roster — tracks who's currently employed and their model
+            CREATE TABLE IF NOT EXISTS agent_roster (
+                agent_name  TEXT PRIMARY KEY,   -- 'ceo', 'kevin', 'hr', 'research', etc.
+                role_type   TEXT NOT NULL,      -- 'principal' | 'specialist'
+                model       TEXT NOT NULL,
+                active      INTEGER NOT NULL DEFAULT 1,
+                last_active TEXT,               -- updated every time agent runs
+                hired_at    TEXT NOT NULL,
+                notes       TEXT
+            );
         """)
 
         existing = conn.execute("SELECT id FROM control WHERE id=1").fetchone()
@@ -183,13 +252,31 @@ def init_db() -> None:
                 ),
             )
 
-        # Seed starting cash (paper fund) — $100k
+        # Seed starting cash (paper fund)
         cash_row = conn.execute("SELECT id FROM cash WHERE id=1").fetchone()
         if not cash_row:
             conn.execute(
                 "INSERT INTO cash (id, balance, updated_at) VALUES (1, ?, ?)",
                 (settings.starting_cash_usd, datetime.utcnow().isoformat()),
             )
+
+        # Seed Phase 2.1 principals roster (idempotent — only insert if missing)
+        # HR joins in Phase 2.2.
+        principals = [
+            ("ceo",   "principal", settings.ceo_model,   "Replaces Investment Manager. Owns Board chat and trade decisions."),
+            ("kevin", "principal", settings.kevin_model, "Auditor. Monitors CEO, can flag/block/escalate."),
+        ]
+        now = datetime.utcnow().isoformat()
+        for name, rtype, model, notes in principals:
+            exists = conn.execute("SELECT 1 FROM agent_roster WHERE agent_name=?", (name,)).fetchone()
+            if not exists:
+                conn.execute(
+                    """INSERT INTO agent_roster
+                       (agent_name, role_type, model, active, hired_at, notes)
+                       VALUES (?,?,?,1,?,?)""",
+                    (name, rtype, model, now, notes),
+                )
+
         conn.commit()
 
 
@@ -528,3 +615,178 @@ def operator_threads(limit: int = 20) -> list[dict]:
             })
 
         return threads
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 2.1: Governance accessors
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Agent roster (who's employed + their model) ─────────────────────────────
+
+def get_roster(active_only: bool = True) -> list[dict]:
+    q = "SELECT * FROM agent_roster"
+    if active_only:
+        q += " WHERE active = 1"
+    q += " ORDER BY role_type DESC, agent_name"
+    with get_connection() as conn:
+        return [dict(r) for r in conn.execute(q).fetchall()]
+
+
+def set_agent_model(agent_name: str, model: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO agent_roster (agent_name, role_type, model, active, hired_at)
+               VALUES (?, 'specialist', ?, 1, ?)
+               ON CONFLICT(agent_name) DO UPDATE SET model = excluded.model""",
+            (agent_name, model, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def get_agent_model(agent_name: str, default: str) -> str:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT model FROM agent_roster WHERE agent_name=? AND active=1",
+            (agent_name,),
+        ).fetchone()
+        return row["model"] if row else default
+
+
+def touch_agent(agent_name: str) -> None:
+    """Mark agent as just-active (drives live/idle view)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE agent_roster SET last_active=? WHERE agent_name=?",
+            (datetime.utcnow().isoformat(), agent_name),
+        )
+        conn.commit()
+
+
+# ── Principals' room (CEO ↔ Kevin ↔ HR chat; Board observes) ─────────────────
+
+def add_principal_message(sender: str, body: str, kind: str = "chat",
+                          ref_id: int | None = None) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO principals_messages (sender, kind, ref_id, body, created_at)
+               VALUES (?,?,?,?,?)""",
+            (sender, kind, ref_id, body, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def recent_principal_messages(limit: int = 50) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM principals_messages ORDER BY id DESC LIMIT ?", (limit,),
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+
+# ── Kevin's flags ────────────────────────────────────────────────────────────
+
+def add_kevin_flag(decision_id: int, severity: str, reason: str,
+                   pattern: str | None = None) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO kevin_flags (decision_id, severity, reason, pattern, created_at)
+               VALUES (?,?,?,?,?)""",
+            (decision_id, severity, reason, pattern, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def flags_for_decision(decision_id: int) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM kevin_flags WHERE decision_id=? ORDER BY id DESC",
+            (decision_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def recent_flags(limit: int = 20) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM kevin_flags ORDER BY id DESC LIMIT ?", (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ── Pending approvals (Kevin blocks → Board approves/rejects) ────────────────
+
+def add_pending_approval(decision_id: int, symbol: str, direction: str,
+                         size_usd: float, ceo_reason: str,
+                         kevin_reason: str) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO pending_approvals
+               (decision_id, symbol, direction, size_usd, ceo_reason, kevin_reason, created_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (decision_id, symbol, direction, size_usd, ceo_reason, kevin_reason,
+             datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def pending_approvals(status: str = "pending") -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM pending_approvals WHERE status=? ORDER BY id DESC",
+            (status,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def decide_pending(approval_id: int, decision: str, decided_by: str = "board") -> None:
+    assert decision in ("approved", "rejected")
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE pending_approvals
+               SET status=?, decided_by=?, decided_at=?
+               WHERE id=?""",
+            (decision, decided_by, datetime.utcnow().isoformat(), approval_id),
+        )
+        conn.commit()
+
+
+def get_pending(approval_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM pending_approvals WHERE id=?", (approval_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+# ── Board alerts ─────────────────────────────────────────────────────────────
+
+def add_board_alert(priority: str, subject: str, body: str,
+                    source: str = "system", ref_id: int | None = None) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO board_alerts (priority, subject, body, source, ref_id, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (priority, subject, body, source, ref_id, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def unread_board_alerts() -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM board_alerts WHERE read_at IS NULL ORDER BY id DESC LIMIT 50"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_alert_read(alert_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE board_alerts SET read_at=? WHERE id=?",
+            (datetime.utcnow().isoformat(), alert_id),
+        )
+        conn.commit()

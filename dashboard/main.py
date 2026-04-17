@@ -19,14 +19,24 @@ from fund.database import (
     active_directives,
     add_directive,
     add_message,
+    decide_pending,
+    flags_for_decision,
     get_cash,
     get_connection,
+    get_pending,
     get_portfolio,
+    get_roster,
+    mark_alert_read,
     operator_threads,
+    pending_approvals,
     read_control,
+    recent_flags,
     recent_messages,
+    recent_principal_messages,
     recent_snapshots,
+    set_agent_model,
     spend_breakdown_last_week,
+    unread_board_alerts,
     update_control,
     weekly_spend,
 )
@@ -186,6 +196,128 @@ def spend():
         total = sum(breakdown.values())
         return {"total": round(total, 4), "by_agent": breakdown,
                 "cap_total": 1.0, "caps": {}}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 2.1: Governance endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Agent roster (live/idle view) ────────────────────────────────────────────
+
+@app.get("/api/roster")
+def roster():
+    from datetime import datetime
+    rows = get_roster(active_only=True)
+    now = datetime.utcnow()
+    for r in rows:
+        la = r.get("last_active")
+        if la:
+            try:
+                delta = (now - datetime.fromisoformat(la)).total_seconds()
+                r["seconds_since_active"] = int(delta)
+                r["live"] = delta < 120    # active within last 2 min
+            except Exception:
+                r["seconds_since_active"] = None
+                r["live"] = False
+        else:
+            r["seconds_since_active"] = None
+            r["live"] = False
+    return {"roster": rows}
+
+
+class AgentModelUpdate(BaseModel):
+    agent_name: str
+    model:      str
+
+
+@app.patch("/api/roster/model")
+def update_agent_model(update: AgentModelUpdate):
+    set_agent_model(update.agent_name, update.model)
+    return {"ok": True, "agent_name": update.agent_name, "model": update.model}
+
+
+# ── Principals' chat room (CEO ↔ Kevin) ──────────────────────────────────────
+
+@app.get("/api/principals-chat")
+def principals_chat(limit: int = 50):
+    return {"messages": recent_principal_messages(limit=limit)}
+
+
+# ── Kevin flags ──────────────────────────────────────────────────────────────
+
+@app.get("/api/kevin-flags")
+def kevin_flags(limit: int = 20):
+    return {"flags": recent_flags(limit=limit)}
+
+
+# ── Pending approvals (Kevin blocks → Board decides) ─────────────────────────
+
+@app.get("/api/pending-approvals")
+def list_pending_approvals():
+    return {"pending": pending_approvals(status="pending")}
+
+
+class ApprovalDecision(BaseModel):
+    decision: str  # "approved" or "rejected"
+
+
+@app.post("/api/pending-approvals/{approval_id}")
+def decide_approval(approval_id: int, body: ApprovalDecision):
+    if body.decision not in ("approved", "rejected"):
+        raise HTTPException(400, "decision must be 'approved' or 'rejected'")
+    row = get_pending(approval_id)
+    if not row:
+        raise HTTPException(404, "pending approval not found")
+    if row["status"] != "pending":
+        raise HTTPException(409, f"already {row['status']}")
+
+    decide_pending(approval_id, body.decision, decided_by="board")
+
+    # If approved, the Board is saying "execute despite Kevin's block".
+    # We'll record the Board override in the principals' chat for audit.
+    # Actual execution is deferred — Phase 2.1 implementation: we log the
+    # override and leave re-execution for a future cycle (manual re-trigger).
+    from fund.database import add_principal_message, add_board_alert
+    add_principal_message(
+        "board",
+        f"Board {body.decision.upper()} Kevin's block on {row['symbol']} "
+        f"({row['direction']} ${row['size_usd']:.0f}).",
+        kind="chat",
+        ref_id=approval_id,
+    )
+    return {"ok": True, "decision": body.decision, "approval": get_pending(approval_id)}
+
+
+# ── Board alerts (inbox) ─────────────────────────────────────────────────────
+
+@app.get("/api/alerts")
+def alerts():
+    return {"alerts": unread_board_alerts()}
+
+
+@app.post("/api/alerts/{alert_id}/read")
+def read_alert(alert_id: int):
+    mark_alert_read(alert_id)
+    return {"ok": True}
+
+
+# ── Enhanced decisions endpoint that includes Kevin flags ───────────────────
+
+@app.get("/api/decisions")
+def decisions(limit: int = 20):
+    """Like /api/threads but enriched with Kevin flags for each decision."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM manager_decisions ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["kevin_flags"] = flags_for_decision(d["id"])
+        out.append(d)
+    return {"decisions": out}
 
 
 # ── Dev runner ────────────────────────────────────────────────────────────────

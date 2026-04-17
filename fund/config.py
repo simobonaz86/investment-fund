@@ -19,8 +19,15 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
 
     # ── Per-agent models ──────────────────────────────────────────────────────
-    # Manager synthesises — use Sonnet. Specialists are narrow — Haiku is plenty.
+    # Phase 2.1: Two permanent agents — Board chooses these models.
+    # HR joins in Phase 2.2.
+    ceo_model:          str = "anthropic/claude-sonnet-4-6"
+    kevin_model:        str = "anthropic/claude-sonnet-4-6"   # Auditor needs good reasoning
+
+    # Legacy alias — some call sites still import manager_model
     manager_model:      str = "anthropic/claude-sonnet-4-6"
+
+    # Specialist defaults — CEO can override at runtime via agent_roster table.
     research_model:     str = "anthropic/claude-haiku-4-5-20251001"
     risk_model:         str = "anthropic/claude-haiku-4-5-20251001"
     sentiment_model:    str = "anthropic/claude-haiku-4-5-20251001"
@@ -33,12 +40,14 @@ class Settings(BaseSettings):
     db_path:        str = "data/fund.db"
 
     # ── Defaults seeded into the control table on first start ─────────────────
-    default_assets_str:           str   = "SYN-A,SYN-B,SYN-C"
-    default_momentum_threshold:   float = 0.030
+    # Phase 2.1: real tickers. CEO can expand at runtime.
+    # Equities (US single stocks + ETFs) plus bond ETFs (TLT long Treasuries, IEF intermediate, HYG high-yield, LQD IG corporates).
+    default_assets_str:           str   = "NVDA,AMZN,GOOGL,META,VWRP,VUSA,TLT,IEF,HYG,LQD"
+    default_momentum_threshold:   float = 0.015
     default_confidence_threshold: float = 0.70
     default_max_position_usd:     float = 1000.0
-    default_check_interval:       int   = 60
-    default_cooldown_minutes:     int   = 15
+    default_check_interval:       int   = 120
+    default_cooldown_minutes:     int   = 30
 
     # ── Budget caps (hard limits, not runtime-mutable for safety) ─────────────
     # Start at $1/week for testing.  Raise once Phase 1 is proven stable.

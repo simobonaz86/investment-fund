@@ -1,25 +1,28 @@
 """
-Trading loop orchestration (Phase 1).
+Trading loop orchestration (Phase 2.1).
 
-Major changes vs Phase 0:
-  • Manager HIRES specialists via a reasoning step (not a hardcoded switch)
-  • Structured output via Pydantic (no regex)
-  • Per-cycle cost tracking with budget enforcement
-  • Per-asset cooldown prevents re-firing on persistent moves
-  • Reflection step after each decision writes a lesson for next time
-  • Runtime-mutable control state: thresholds, halt, assets all from DB
+Phase 2.1 additions:
+  • Kevin the Auditor reviews every CEO decision before execution.
+  • Kevin can pass / flag yellow / flag red / block.
+  • Blocks create pending_approval rows — Board approves or rejects via dashboard.
+  • Principals' room (CEO ↔ Kevin chat) captures Kevin's escalations.
+  • Board alerts are raised on red flags and blocks.
 
-Cycle anatomy:
-  1. Read control state      — halt? active assets? threshold?
+Cycle anatomy (Phase 2.1):
+  1. Read control state        — halt? active assets? threshold?
   2. Check weekly budget caps  — overall + per-team
-  3. detect_signals          — pure Python, zero tokens
+  3. detect_signals            — pure Python, zero tokens
   4. For each signal:
-     a. Manager HIRING step  (schema: HiringPlan)
-     b. Hire chosen specialists in parallel (schemas: ResearchVerdict, RiskReport)
-     c. Manager DECIDING step (schema: ManagerDecision)
-     d. If approved, hire Execution (schema: ExecutionResult)
-     e. Reflection writes a lesson (schema: ReflectionNote)
-     f. Set cooldown on the asset
+     a. CEO HIRING step      (schema: HiringPlan)
+     b. Hire specialists     (schemas: ResearchVerdict, RiskReport)
+     c. CEO DECIDING step    (schema: ManagerDecision)
+     d. *** KEVIN REVIEW ***  (schema: KevinReview)  ← new in 2.1
+         - pass:     proceed
+         - flag_*:   proceed, board alert
+         - block:    halt, pending_approval created, skip execution
+     e. If approved, hire Execution (schema: ExecutionResult)
+     f. Reflection writes a lesson (schema: ReflectionNote)
+     g. Set cooldown on the asset
 """
 from __future__ import annotations
 
@@ -32,15 +35,21 @@ import httpx
 from crewai import Crew, Task, Process
 
 from fund.agents import (
+    build_ceo,
     build_execution_agent,
-    build_investment_manager,
+    build_kevin,
     build_reflection_agent,
     build_research_analyst,
     build_risk_manager,
 )
 from fund.config   import settings
 from fund.database import (
+    add_board_alert,
+    add_kevin_flag,
     add_lesson,
+    add_pending_approval,
+    add_principal_message,
+    get_portfolio,
     init_db,
     is_on_cooldown,
     log_cost,
@@ -50,12 +59,14 @@ from fund.database import (
     set_cooldown,
     set_halted,
     spend_breakdown_last_week,
+    touch_agent,
     weekly_spend,
 )
 from fund.market_data import pct_change
 from fund.schemas import (
     ExecutionResult,
     HiringPlan,
+    KevinReview,
     ManagerDecision,
     ReflectionNote,
     ResearchVerdict,
@@ -183,25 +194,26 @@ def detect_signals(ctrl: dict) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Phase A — Manager decides who to hire
+# Phase A — CEO decides who to hire
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_hiring_step(signal: dict) -> HiringPlan | None:
-    """Manager's first reasoning step: given this signal, who do we need?"""
-    ok, why = _budget_ok("manager")
+    """CEO's first reasoning step: given this signal, who do we need?"""
+    ok, why = _budget_ok("manager")  # budget bucket still "manager" for backcompat
     if not ok:
         log.warning("hiring skipped — %s", why)
         return None
 
     sym  = signal["symbol"]
     pct  = signal["pct_change"]
-    manager = build_investment_manager()
+    ceo = build_ceo()
+    touch_agent("ceo")
     lessons = recent_lessons(symbol=sym, limit=3)
     lesson_text = "\n".join(f"  • {l['outcome']}: {l['note']}" for l in lessons) or "  (none yet)"
 
     task = Task(
         description=f"""
-You've received a price-momentum signal: {sym} moved {pct:+.1%}.
+You are the CEO. You've received a price-momentum signal: {sym} moved {pct:+.1%}.
 
 Recent lessons learned for this asset:
 {lesson_text}
@@ -212,17 +224,19 @@ Rules of thumb:
   • Research — almost always YES (evidence before action)
   • Risk — YES if the portfolio already holds {sym}, or if overall portfolio
     concentration is high
-  • Sentiment — only if a news/earnings event seems relevant (default NO in sim)
+  • Sentiment — only if a news/earnings event seems relevant (default NO)
+
+Remember: Kevin (your Auditor) will review your final decision. Write reasoning he can follow.
 
 Return a HiringPlan.
 """,
         expected_output="A HiringPlan object.",
-        agent=manager,
+        agent=ceo,
         output_pydantic=HiringPlan,
     )
 
-    _, plan, cost = _run_crew_tracked("manager", [manager], [task], task_ref=f"{sym}:hire")
-    log.info("  manager.hire  research=%s risk=%s sentiment=%s  ($%.4f)",
+    _, plan, cost = _run_crew_tracked("manager", [ceo], [task], task_ref=f"{sym}:hire")
+    log.info("  ceo.hire  research=%s risk=%s sentiment=%s  ($%.4f)",
              plan.hire_research if plan else "?",
              plan.hire_risk if plan else "?",
              plan.hire_sentiment if plan else "?",
@@ -307,7 +321,8 @@ def run_decision_step(
         log.warning("decision skipped — %s", why); return None
 
     sym = signal["symbol"]
-    manager = build_investment_manager()
+    ceo = build_ceo()
+    touch_agent("ceo")
 
     research_txt = (
         f"  verdict={research.verdict} confidence={research.confidence:.2f} "
@@ -320,7 +335,7 @@ def run_decision_step(
 
     task = Task(
         description=f"""
-You now have the specialist reports for {sym}:
+You are the CEO. You now have the specialist reports for {sym}:
 
 Research:
 {research_txt}
@@ -338,19 +353,172 @@ Rules (non-negotiable):
   • Risk assessment 'block' → TRADE: NO
   • Size: min(max_position_usd, risk.recommended_size_usd if risk else max_position_usd)
 
+Kevin will audit your decision. Write a reason that explains trade-offs clearly.
+
 Return a ManagerDecision.
 """,
         expected_output="A ManagerDecision.",
-        agent=manager,
+        agent=ceo,
         output_pydantic=ManagerDecision,
     )
-    _, decision, cost = _run_crew_tracked("manager", [manager], [task], task_ref=f"{sym}:decide")
-    log.info("  manager.decide %s %s $%.0f  ($%.4f)",
+    _, decision, cost = _run_crew_tracked("manager", [ceo], [task], task_ref=f"{sym}:decide")
+    log.info("  ceo.decide %s %s $%.0f  ($%.4f)",
              "TRADE" if decision and decision.trade else "SKIP",
              decision.direction if decision else "?",
              decision.size_usd if decision else 0.0,
              cost)
     return decision
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase C2 — Kevin reviews the CEO's decision (new in 2.1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_kevin_review(signal: dict, decision: ManagerDecision,
+                     research: ResearchVerdict | None,
+                     risk: RiskReport | None,
+                     ctrl: dict) -> KevinReview | None:
+    """
+    Kevin audits the CEO's decision before it reaches Execution.
+    Returns a KevinReview. Calling code acts on .action:
+      pass       → no-op
+      flag_*     → log flag, board alert, proceed
+      block      → create pending_approval, board alert, skip execution
+    """
+    ok, why = _budget_ok("risk")  # budget Kevin under the "risk" bucket
+    if not ok:
+        log.warning("kevin review skipped — %s; defaulting to pass", why)
+        return KevinReview(action="pass", reason="audit skipped — budget cap")
+
+    sym = signal["symbol"]
+    kevin = build_kevin()
+    touch_agent("kevin")
+
+    # Build decision summary for Kevin
+    research_txt = (
+        f"Research: {research.verdict} conf {research.confidence:.2f} — {research.reason}"
+        if research else "Research: not hired"
+    )
+    risk_txt = (
+        f"Risk: {risk.assessment} rec ${risk.recommended_size_usd:.0f} — {risk.reason}"
+        if risk else "Risk: not hired"
+    )
+
+    # Portfolio context
+    pos = get_portfolio()
+    pos_count = len(pos)
+
+    task = Task(
+        description=f"""
+You are Kevin, the Auditor. Review the CEO's decision for {sym}.
+
+CEO's inputs:
+  • Signal: {signal['pct_change']:+.1%} move on {sym}
+  • {research_txt}
+  • {risk_txt}
+  • Portfolio: {pos_count} existing positions
+  • Confidence threshold in force: {ctrl['confidence_threshold']:.2f}
+  • Max position cap: ${ctrl['max_position_usd']:.0f}
+
+CEO's decision:
+  • Trade: {decision.trade}
+  • Direction: {decision.direction}
+  • Size: ${decision.size_usd:.0f}
+  • Reason: {decision.reason}
+
+Review this decision. Pick ONE action:
+
+  • pass — reasoning holds, portfolio impact fine, mandate respected
+  • flag_yellow — minor concern worth noting (trade proceeds)
+  • flag_red — serious concern (trade proceeds, Board is alerted)
+  • block — this trade should not happen (Board approval required to proceed)
+
+Be specific about the concern. Vague flags help no one.
+If you see a recurring pattern (e.g. overtrading a given asset), set concern_pattern.
+
+Return a KevinReview schema.
+""",
+        expected_output="A KevinReview schema.",
+        agent=kevin,
+        output_pydantic=KevinReview,
+    )
+
+    _, review, cost = _run_crew_tracked("risk", [kevin], [task], task_ref=f"{sym}:kevin")
+
+    if review:
+        log.info("  kevin.review %s  ($%.4f)", review.action.upper(), cost)
+    return review
+
+
+def _handle_kevin_review(signal: dict, decision: ManagerDecision,
+                        review: KevinReview, decision_id_placeholder: int) -> bool:
+    """
+    Apply Kevin's review. Returns True if execution should proceed.
+    `decision_id_placeholder` is filled later by log_decision; we reference
+    it once known via flags/pending rows.
+    """
+    sym = signal["symbol"]
+
+    if review.action == "pass":
+        return True
+
+    if review.action == "flag_yellow":
+        add_kevin_flag(decision_id_placeholder, "yellow", review.reason, review.concern_pattern)
+        add_principal_message(
+            "kevin",
+            f"Yellow flag on {sym}: {review.reason}",
+            kind="flag",
+            ref_id=decision_id_placeholder,
+        )
+        return True
+
+    if review.action == "flag_red":
+        add_kevin_flag(decision_id_placeholder, "red", review.reason, review.concern_pattern)
+        add_principal_message(
+            "kevin",
+            f"RED FLAG on {sym}: {review.reason}",
+            kind="flag",
+            ref_id=decision_id_placeholder,
+        )
+        add_board_alert(
+            priority="high",
+            subject=f"Kevin red-flagged trade on {sym}",
+            body=review.reason + (f"\nPattern: {review.concern_pattern}" if review.concern_pattern else ""),
+            source="kevin",
+            ref_id=decision_id_placeholder,
+        )
+        return True
+
+    # block
+    add_kevin_flag(decision_id_placeholder, "red", review.reason, review.concern_pattern)
+    add_pending_approval(
+        decision_id=decision_id_placeholder,
+        symbol=sym,
+        direction=decision.direction,
+        size_usd=decision.size_usd,
+        ceo_reason=decision.reason,
+        kevin_reason=review.reason,
+    )
+    add_principal_message(
+        "kevin",
+        f"BLOCKED trade on {sym}. CEO wanted {decision.direction} ${decision.size_usd:.0f}. "
+        f"Reason: {review.reason}",
+        kind="flag",
+        ref_id=decision_id_placeholder,
+    )
+    add_board_alert(
+        priority="critical",
+        subject=f"Kevin BLOCKED trade on {sym} — approval needed",
+        body=(
+            f"CEO proposed: {decision.direction} ${decision.size_usd:.0f}\n"
+            f"CEO reason:   {decision.reason}\n"
+            f"Kevin reason: {review.reason}"
+        ),
+        source="kevin",
+        ref_id=decision_id_placeholder,
+    )
+    log.warning("  kevin BLOCKED %s — awaiting Board approval", sym)
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -459,7 +627,7 @@ def run_trading_cycle() -> None:
         sym = sig["symbol"]
         log.info("┌─ %s  %+.2f%%", sym, sig["pct_change"] * 100)
 
-        # A. Hiring plan
+        # A. CEO hiring plan
         plan = run_hiring_step(sig)
         if not plan:
             log.info("└─ skip (hiring step failed)")
@@ -476,7 +644,7 @@ def run_trading_cycle() -> None:
             risk = run_risk(sig, proposed_size=ctrl["max_position_usd"])
             specialists_hired.append("risk")
 
-        # C. Decision
+        # C. CEO decision
         decision = run_decision_step(sig, ctrl, research, risk)
         if not decision:
             log.info("└─ skip (decision step failed)")
@@ -488,24 +656,58 @@ def run_trading_cycle() -> None:
             decision.trade = False
             decision.reason = f"confidence {research.confidence:.2f} below threshold"
 
-        # D. Execution
-        fill = None
-        if decision.trade and decision.direction in ("BUY", "SELL"):
-            fill = run_execution(sig, decision)
-
-        # Audit trail
+        # Log decision now so Kevin's flags have a valid decision_id to attach to
         did = log_decision(
             symbol           = sym,
             pct_change       = sig["pct_change"],
             specialists_hired= ",".join(specialists_hired),
             research_verdict = research.verdict if research else None,
             confidence       = research.confidence if research else None,
-            trade_taken      = decision.trade,
+            trade_taken      = decision.trade,       # may be flipped by Kevin block below
             direction        = decision.direction,
             size_usd         = decision.size_usd,
             reason           = decision.reason,
-            fill_price       = fill.fill_price if fill else None,
+            fill_price       = None,                  # updated after execution
         )
+
+        # C2. Kevin's audit — only runs if CEO actually proposes a trade
+        proceed_to_exec = True
+        if decision.trade and decision.direction in ("BUY", "SELL"):
+            review = run_kevin_review(sig, decision, research, risk, ctrl)
+            if review:
+                proceed_to_exec = _handle_kevin_review(sig, decision, review, did)
+                if not proceed_to_exec:
+                    # Kevin blocked — reflect in the log
+                    log.info("  trade halted pending Board approval")
+
+        # D. Execution (only if Kevin didn't block)
+        fill = None
+        if proceed_to_exec and decision.trade and decision.direction in ("BUY", "SELL"):
+            fill = run_execution(sig, decision)
+            # Update the decision row with fill info (lightweight patch)
+            if fill and fill.fill_price:
+                try:
+                    from fund.database import get_connection
+                    with get_connection() as conn:
+                        conn.execute(
+                            "UPDATE manager_decisions SET fill_price=? WHERE id=?",
+                            (fill.fill_price, did),
+                        )
+                        conn.commit()
+                except Exception:
+                    log.exception("failed to patch fill_price")
+
+        # If Kevin blocked, force trade_taken=0 in the decision record
+        if not proceed_to_exec and decision.trade:
+            try:
+                from fund.database import get_connection
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE manager_decisions SET trade_taken=0 WHERE id=?", (did,),
+                    )
+                    conn.commit()
+            except Exception:
+                log.exception("failed to mark blocked decision")
 
         # E. Reflection + cooldown
         run_reflection(sig, decision, fill, did)
@@ -522,14 +724,16 @@ def run_loop() -> None:
     init_db()
     ctrl = read_control()
     log.info(
-        "Investment Fund — Phase 1\n"
-        "  Manager model   : %s\n"
+        "Investment Fund — Phase 2.1\n"
+        "  CEO model       : %s\n"
+        "  Kevin model     : %s\n"
         "  Specialist model: %s\n"
         "  Weekly cap total: $%.2f\n"
         "  Assets          : %s\n"
         "  Threshold       : %.1f%%\n"
         "  Confidence      : %.0f%%",
-        settings.manager_model,
+        settings.ceo_model,
+        settings.kevin_model,
         settings.research_model,
         settings.weekly_budget_total_usd,
         ctrl["assets"],
