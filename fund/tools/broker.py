@@ -12,6 +12,7 @@ from crewai.tools import tool
 
 from fund.config import settings
 from fund.database import upsert_position, adjust_cash, get_cash, read_control
+from fund.market_data import get_quote
 
 _SIM_URL = os.getenv("MARKET_SIM_URL", "http://localhost:8001")
 _SLIPPAGE = 0.0010    # 10 bp simulated slippage
@@ -49,13 +50,8 @@ def place_paper_order(symbol: str, direction: str, amount_usd: float) -> str:
     sym = symbol.strip().upper()
 
     try:
-        # ── Get fill price from sim ────────────────────────────────────────────
-        r = httpx.get(
-            f"{_SIM_URL}/v2/stocks/{sym}/quotes/latest",
-            timeout=_TIMEOUT,
-        )
-        r.raise_for_status()
-        quote = r.json()["quote"]
+        # ── Get fill price via adapter (sim or yfinance) ──────────────────────
+        quote = get_quote(sym)
 
         mid_price = (quote["ap"] + quote["bp"]) / 2.0
 
@@ -133,15 +129,12 @@ def get_portfolio_state() -> str:
             qty = float(row["quantity"])
             avg = float(row["avg_cost"])
 
-            # Fetch current price for P&L
+            # Fetch current price via adapter
             try:
-                r = httpx.get(
-                    f"{_SIM_URL}/v2/stocks/{sym}/quotes/latest",
-                    timeout=3.0,
-                )
-                price = r.json()["quote"]["bp"]
+                q = get_quote(sym)
+                price = q["bp"]
             except Exception:
-                price = avg   # fallback to cost if sim unreachable
+                price = avg   # fallback to cost if data unavailable
 
             mv  = qty * price
             pnl = mv - (qty * avg)

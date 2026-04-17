@@ -20,11 +20,29 @@ services:
       MARKET_SIM_URL: http://market_sim:8001
       DB_PATH: /data/fund.db
     ports:
-      - "8002:8002"        # Control API — /status, /stop, /resume, /spend, /decisions
+      - "8002:8002"
     volumes:
       - fund_data:/data
     restart: unless-stopped
     command: python run.py
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    depends_on:
+      - fund
+    env_file:
+      - .env
+    environment:
+      DB_PATH: /data/fund.db
+      FUND_CONTROL_URL: http://fund:8002
+      MARKET_SIM_URL: http://market_sim:8001
+    ports:
+      - "8080:8080"
+    volumes:
+      - fund_data:/data
+    restart: unless-stopped
 
 volumes:
   fund_data:

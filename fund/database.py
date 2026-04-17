@@ -134,6 +134,35 @@ def init_db() -> None:
                 balance    REAL NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            -- Board ↔ Manager chat history
+            CREATE TABLE IF NOT EXISTS messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender     TEXT NOT NULL,      -- 'board' | 'manager' | 'system'
+                kind       TEXT NOT NULL,      -- 'chat' | 'daily' | 'weekly' | 'monthly' | 'quarterly'
+                body       TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_created
+                ON messages(created_at);
+
+            -- Board directives active in the Manager's system prompt
+            CREATE TABLE IF NOT EXISTS directives (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                text       TEXT NOT NULL,
+                expires_at TEXT,
+                active     INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            -- Nightly equity snapshots for historical P&L
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                cash         REAL NOT NULL,
+                positions_mv REAL NOT NULL,
+                total_equity REAL NOT NULL,
+                snapshot_at  TEXT NOT NULL
+            );
         """)
 
         existing = conn.execute("SELECT id FROM control WHERE id=1").fetchone()
@@ -396,3 +425,106 @@ def reset_cash(amount: float) -> float:
         )
         conn.commit()
         return amount
+
+
+# ── Messages (Board ↔ Manager chat) ──────────────────────────────────────────
+
+def add_message(sender: str, body: str, kind: str = "chat") -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO messages (sender, kind, body, created_at) VALUES (?,?,?,?)",
+            (sender, kind, body, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def recent_messages(limit: int = 50) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM messages ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+
+# ── Directives (standing orders for the Manager) ─────────────────────────────
+
+def add_directive(text: str, expires_at: str | None = None) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO directives (text, expires_at, active, created_at) VALUES (?,?,1,?)",
+            (text, expires_at, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def active_directives() -> list[dict]:
+    now = datetime.utcnow().isoformat()
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT * FROM directives
+               WHERE active = 1 AND (expires_at IS NULL OR expires_at > ?)
+               ORDER BY id DESC""",
+            (now,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def deactivate_directive(directive_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE directives SET active=0 WHERE id=?", (directive_id,))
+        conn.commit()
+
+
+# ── Portfolio snapshots ───────────────────────────────────────────────────────
+
+def save_snapshot(cash: float, positions_mv: float) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO portfolio_snapshots
+               (cash, positions_mv, total_equity, snapshot_at)
+               VALUES (?,?,?,?)""",
+            (cash, positions_mv, cash + positions_mv, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def recent_snapshots(limit: int = 30) -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM portfolio_snapshots ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in reversed(rows)]
+
+
+# ── Operators chat projection (reads manager_decisions + costs as "threads") ──
+
+def operator_threads(limit: int = 20) -> list[dict]:
+    """
+    Project the decision log into chat-style threads for the dashboard.
+    Each thread is a signal → agent exchange → outcome.
+    """
+    with get_connection() as conn:
+        decisions = conn.execute(
+            "SELECT * FROM manager_decisions ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+        threads = []
+        for d in decisions:
+            # Find cost rows for this decision's symbol near the decision time
+            costs = conn.execute(
+                """SELECT agent_name, model, cost_usd, created_at
+                   FROM agent_costs
+                   WHERE task_ref LIKE ? AND created_at <= ?
+                   ORDER BY id DESC LIMIT 8""",
+                (f"%{d['symbol']}%", d["created_at"]),
+            ).fetchall()
+            threads.append({
+                "decision": dict(d),
+                "costs":    [dict(c) for c in costs],
+            })
+
+        return threads

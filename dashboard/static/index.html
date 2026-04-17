@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#fafaf7">
+<title>Investment Fund — Board</title>
+<style>
+  :root {
+    --bg: #fafaf7; --bg2: #f3f1ec; --bg3: #e8e5dd;
+    --surface: #ffffff; --border: rgba(0,0,0,0.08); --border-2: rgba(0,0,0,0.15);
+    --text: #1d1d1a; --text-2: #5f5e5a; --text-3: #888780;
+    --info: #185FA5; --info-bg: #E6F1FB;
+    --success: #0F6E56; --success-bg: #E1F5EE;
+    --warning: #854F0B; --warning-bg: #FAEEDA;
+    --danger: #A32D2D; --danger-bg: #FCEBEB;
+    --purple: #3C3489; --purple-bg: #EEEDFE;
+    --coral: #993C1D; --coral-bg: #FAECE7;
+    --green: #3B6D11; --green-bg: #EAF3DE;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1a1917; --bg2: #242320; --bg3: #2f2e2a;
+      --surface: #1d1c1a; --border: rgba(255,255,255,0.1); --border-2: rgba(255,255,255,0.2);
+      --text: #e8e6df; --text-2: #b4b2a9; --text-3: #888780;
+      --info-bg: #0C447C; --info: #B5D4F4;
+      --success-bg: #085041; --success: #9FE1CB;
+      --warning-bg: #633806; --warning: #FAC775;
+      --danger-bg: #791F1F; --danger: #F7C1C1;
+      --purple-bg: #3C3489; --purple: #CECBF6;
+      --coral-bg: #712B13; --coral: #F5C4B3;
+      --green-bg: #27500A; --green: #C0DD97;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; font: 14px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  .app { max-width: 520px; margin: 0 auto; min-height: 100vh; background: var(--bg); }
+  .header { padding: 14px 16px 12px; border-bottom: 0.5px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .header h1 { margin: 0; font-size: 16px; font-weight: 500; }
+  .header .label { margin: 0 0 2px; font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: .08em; }
+  .pill { padding: 3px 10px; border-radius: 10px; font-size: 11px; font-weight: 500; background: var(--success-bg); color: var(--success); }
+  .pill.halted { background: var(--danger-bg); color: var(--danger); }
+  .tabs { display: flex; background: var(--bg); border-bottom: 0.5px solid var(--border); position: sticky; top: 0; z-index: 10; }
+  .tab { flex: 1; padding: 10px 2px; background: transparent; border: none; font: inherit; font-size: 10px; color: var(--text-2); cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 3px; border-bottom: 2px solid transparent; position: relative; }
+  .tab.active { color: var(--text); border-bottom-color: var(--text); }
+  .tab svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.6; }
+  .tab .badge { position: absolute; top: 6px; right: 6px; background: var(--danger); color: #fff; font-size: 9px; padding: 1px 5px; border-radius: 8px; font-weight: 500; min-width: 14px; text-align: center; }
+  .panel { padding: 14px; display: none; }
+  .panel.active { display: block; }
+  .card { background: var(--surface); border: 0.5px solid var(--border); border-radius: 12px; padding: 12px 14px; margin-bottom: 10px; }
+  .card.sub { background: var(--bg2); border: none; }
+  .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+  .metric { background: var(--bg2); border-radius: 8px; padding: 10px 12px; }
+  .metric .label { margin: 0 0 2px; font-size: 10px; color: var(--text-2); text-transform: uppercase; letter-spacing: .06em; }
+  .metric .value { margin: 0; font-size: 18px; font-weight: 500; }
+  .metric .sub { margin: 1px 0 0; font-size: 11px; color: var(--text-3); }
+  .section-label { margin: 10px 0 6px; font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: .08em; font-weight: 500; }
+  .row { display: flex; justify-content: space-between; padding: 5px 0; font-size: 12px; border-bottom: 0.5px solid var(--border); }
+  .row:last-child { border-bottom: none; }
+  .row .sym { font-weight: 500; }
+  .row .sub { color: var(--text-3); font-size: 11px; }
+  .btn-stop { width: 100%; padding: 13px; background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); border-radius: 8px; font: inherit; font-size: 14px; font-weight: 500; cursor: pointer; }
+  .btn-resume { background: var(--success-bg); color: var(--success); border-color: var(--success); }
+  .btn-primary { width: 100%; padding: 11px; background: var(--info-bg); color: var(--info); border: 1px solid var(--info); border-radius: 8px; font: inherit; font-size: 13px; font-weight: 500; cursor: pointer; }
+  input[type=range] { width: 100%; }
+  input[type=text], input[type=search], textarea, select { width: 100%; font: inherit; font-size: 12px; padding: 6px 10px; background: var(--surface); color: var(--text); border: 0.5px solid var(--border-2); border-radius: 6px; }
+  textarea { resize: none; border-radius: 18px; padding: 9px 12px; }
+  .thread { border-left: 3px solid var(--info); padding-left: 10px; margin-bottom: 14px; }
+  .thread.hold { border-left-color: var(--warning); }
+  .thread.halted { border-left-color: var(--danger); }
+  .thread-header { display: flex; justify-content: space-between; margin-bottom: 8px; }
+  .thread-title { margin: 0; font-size: 11px; font-weight: 500; color: var(--info); text-transform: uppercase; letter-spacing: .05em; }
+  .thread.hold .thread-title { color: var(--warning); }
+  .thread-time { font-size: 11px; color: var(--text-3); }
+  .msg { display: flex; gap: 8px; margin-bottom: 8px; }
+  .avatar { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 500; font-size: 11px; flex-shrink: 0; }
+  .avatar.M { background: var(--purple-bg); color: var(--purple); }
+  .avatar.R { background: var(--success-bg); color: var(--success); }
+  .avatar.K { background: var(--coral-bg); color: var(--coral); }
+  .avatar.E { background: var(--info-bg); color: var(--info); }
+  .avatar.F { background: var(--green-bg); color: var(--green); }
+  .msg-body { flex: 1; min-width: 0; }
+  .msg-who { margin: 0 0 2px; font-size: 11px; }
+  .msg-who .name { font-weight: 500; }
+  .msg-who .time { color: var(--text-3); margin-left: 4px; }
+  .bubble { background: var(--bg2); border-radius: 8px; padding: 8px 10px; font-size: 12px; line-height: 1.45; }
+  .bubble.M { background: var(--purple-bg); color: var(--purple); }
+  .bubble.R { background: var(--success-bg); color: var(--success); }
+  .bubble.K { background: var(--coral-bg); color: var(--coral); }
+  .bubble.E { background: var(--info-bg); color: var(--info); }
+  .bubble.F { background: var(--green-bg); color: var(--green); }
+  .tool-call { background: var(--bg2); border-radius: 6px; padding: 5px 8px; font-size: 11px; color: var(--text-3); margin-bottom: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .outcome { border-radius: 8px; padding: 8px 10px; font-size: 12px; margin-top: 6px; display: flex; justify-content: space-between; }
+  .outcome.buy { background: var(--success-bg); color: var(--success); }
+  .outcome.sell { background: var(--info-bg); color: var(--info); }
+  .outcome.hold { background: var(--warning-bg); color: var(--warning); }
+  .chat-log { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-height: 320px; }
+  .chat-msg { max-width: 85%; }
+  .chat-msg.board { align-self: flex-end; }
+  .chat-msg.manager, .chat-msg.system { align-self: flex-start; }
+  .chat-msg .who { margin: 0 0 3px; font-size: 11px; color: var(--text-3); }
+  .chat-msg.board .who { text-align: right; }
+  .chat-bubble { border-radius: 16px 16px 16px 4px; padding: 10px 14px; font-size: 12px; line-height: 1.5; background: var(--bg2); }
+  .chat-msg.board .chat-bubble { border-radius: 16px 16px 4px 16px; background: var(--info-bg); color: var(--info); }
+  .chat-msg.system .chat-bubble { background: var(--bg3); color: var(--text-3); font-size: 11px; font-style: italic; }
+  .chat-input { padding: 10px 16px; border-top: 0.5px solid var(--border); display: flex; gap: 8px; align-items: flex-end; background: var(--bg); }
+  .chat-input button { background: var(--info-bg); color: var(--info); border: none; border-radius: 50%; width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; }
+  .chip { display: inline-block; margin: 2px 3px 0 0; padding: 3px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; background: var(--bg3); color: var(--text-3); cursor: pointer; }
+  .chip.active { background: var(--success-bg); color: var(--success); }
+  .alloc-bar { display: flex; height: 14px; border-radius: 3px; overflow: hidden; margin-bottom: 8px; }
+  .muted { color: var(--text-3); }
+  .sm { font-size: 11px; }
+  .loading { padding: 20px; text-align: center; color: var(--text-3); font-size: 12px; }
+  .empty { padding: 20px; text-align: center; color: var(--text-3); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <div>
+      <p class="label">Board</p>
+      <h1>Investment fund</h1>
+    </div>
+    <span id="status-pill" class="pill">● running</span>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab active" data-tab="overview" aria-label="Overview">
+      <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+      Overview
+    </button>
+    <button class="tab" data-tab="ops" aria-label="Operators">
+      <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      Operators
+      <span id="ops-badge" class="badge" style="display:none"></span>
+    </button>
+    <button class="tab" data-tab="chat" aria-label="Manager chat">
+      <svg viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+      Manager
+    </button>
+    <button class="tab" data-tab="controls" aria-label="Controls">
+      <svg viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+      Controls
+    </button>
+    <button class="tab" data-tab="spend" aria-label="Spend">
+      <svg viewBox="0 0 24 24"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+      Spend
+    </button>
+  </div>
+
+  <div id="overview" class="panel active">
+    <div class="metric-grid">
+      <div class="metric"><p class="label">Total equity</p><p class="value" id="ov-equity">—</p><p class="sub" id="ov-equity-sub">&nbsp;</p></div>
+      <div class="metric"><p class="label">Cash to deploy</p><p class="value" id="ov-cash">—</p><p class="sub" id="ov-cash-sub">&nbsp;</p></div>
+    </div>
+    <p class="section-label">Top positions</p>
+    <div class="card" id="top-positions"><div class="loading">Loading…</div></div>
+    <p class="section-label">Weekly spend</p>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px;font-size:13px">
+        <span>Agent spend this week</span><span id="ov-spend">—</span>
+      </div>
+      <div style="height:5px;background:var(--bg3);border-radius:3px;overflow:hidden">
+        <div id="ov-spend-bar" style="width:0%;height:100%;background:var(--info)"></div>
+      </div>
+    </div>
+    <button id="stop-btn" class="btn-stop" onclick="toggleHalt()">■ Stop all operations</button>
+  </div>
+
+  <div id="ops" class="panel">
+    <div id="ops-threads"><div class="loading">Loading threads…</div></div>
+  </div>
+
+  <div id="chat" class="panel" style="padding:0">
+    <div style="padding:12px 16px;border-bottom:0.5px solid var(--border)">
+      <p style="margin:0 0 2px;font-size:13px;font-weight:500">Chat with Investment Manager</p>
+      <p class="sm muted" style="margin:0">Your messages with directive language ("never", "focus on…") become standing orders.</p>
+    </div>
+    <div id="chat-log" class="chat-log"></div>
+    <div class="chat-input">
+      <textarea id="chat-text" rows="1" placeholder="Message the Manager…"></textarea>
+      <button onclick="sendChat()" aria-label="Send">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div id="controls" class="panel">
+    <p class="section-label">Trading parameters</p>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;margin-bottom:5px"><span class="sm">Momentum threshold</span><span class="sm" style="font-weight:500"><span id="mom-out">—</span>%</span></div>
+      <input type="range" id="mom-range" min="0.5" max="10" step="0.5">
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;margin-bottom:5px"><span class="sm">Min research confidence</span><span class="sm" style="font-weight:500" id="conf-out">—</span></div>
+      <input type="range" id="conf-range" min="0.5" max="0.95" step="0.05">
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;margin-bottom:5px"><span class="sm">Max position size (£)</span><span class="sm" style="font-weight:500">£<span id="pos-out">—</span></span></div>
+      <input type="range" id="pos-range" min="500" max="20000" step="500">
+    </div>
+    <button class="btn-primary" onclick="saveControls()">Save changes</button>
+  </div>
+
+  <div id="spend" class="panel">
+    <div class="card">
+      <p class="label" style="margin:0 0 3px">Week total</p>
+      <p style="margin:0 0 4px;font-size:22px;font-weight:500"><span id="sp-total">—</span> <span class="sm muted">/ $<span id="sp-cap">1.00</span></span></p>
+      <div style="height:5px;background:var(--bg3);border-radius:3px;overflow:hidden">
+        <div id="sp-bar" style="width:0%;height:100%;background:var(--info)"></div>
+      </div>
+    </div>
+    <p class="section-label">By agent</p>
+    <div id="sp-breakdown" class="card"><div class="loading">Loading…</div></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmtGBP = n => '£' + (n || 0).toLocaleString('en-GB', {maximumFractionDigits: 0});
+const fmtUSD = n => '$' + (n || 0).toFixed(4);
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === name));
+  if (name === 'overview') loadOverview();
+  if (name === 'ops') loadOps();
+  if (name === 'chat') loadChat();
+  if (name === 'controls') loadControls();
+  if (name === 'spend') loadSpend();
+}
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, Object.assign({headers: {'Content-Type': 'application/json'}}, opts));
+  if (!r.ok) throw new Error(`${r.status}`);
+  return r.json();
+}
+
+async function loadOverview() {
+  try {
+    const d = await api('/api/overview');
+    $('ov-equity').textContent = fmtGBP(d.total_equity);
+    $('ov-equity-sub').textContent = `${d.n_positions} positions`;
+    $('ov-cash').textContent = fmtGBP(d.cash);
+    $('ov-cash-sub').textContent = d.total_equity ? `${((d.cash/d.total_equity)*100).toFixed(0)}% of total` : '';
+    const pct = d.weekly_cap > 0 ? (d.weekly_spend / d.weekly_cap * 100) : 0;
+    $('ov-spend').textContent = `$${d.weekly_spend.toFixed(4)} / $${d.weekly_cap.toFixed(2)}`;
+    $('ov-spend-bar').style.width = Math.min(100, pct) + '%';
+    const tp = $('top-positions');
+    if (!d.top_positions || !d.top_positions.length) {
+      tp.innerHTML = '<div class="empty">No positions yet. Run seed_portfolio.</div>';
+    } else {
+      tp.innerHTML = d.top_positions.map(p =>
+        `<div class="row"><span class="sym">${p.symbol}</span><span>${fmtGBP(p.value)}</span></div>`
+      ).join('');
+    }
+    setHalted(d.halted, d.halt_reason);
+  } catch (e) { console.error(e); }
+}
+
+async function loadOps() {
+  try {
+    const d = await api('/api/threads?limit=10');
+    const wrap = $('ops-threads');
+    if (!d.threads || !d.threads.length) {
+      wrap.innerHTML = '<div class="empty">No decision threads yet. A signal will fire one.</div>';
+      return;
+    }
+    wrap.innerHTML = d.threads.map(t => renderThread(t)).join('');
+  } catch (e) { $('ops-threads').innerHTML = `<div class="empty">Failed to load: ${e}</div>`; }
+}
+
+function renderThread(t) {
+  const dec = t.decision;
+  const costs = t.costs || [];
+  const totalCost = costs.reduce((s, c) => s + (c.cost_usd || 0), 0);
+  let klass = dec.trade_taken ? '' : 'hold';
+  let outcomeClass = dec.trade_taken ? (dec.direction === 'BUY' ? 'buy' : 'sell') : 'hold';
+  let outcomeText = dec.trade_taken
+      ? `✓ ${dec.direction} ${dec.symbol} $${(dec.size_usd||0).toFixed(0)}`
+      : `⚠ HOLD — ${(dec.reason || '').slice(0, 60)}`;
+  const verdict = dec.research_verdict ? `Research: ${dec.research_verdict}, conf ${(dec.confidence||0).toFixed(2)}` : 'No research';
+  const time = (dec.created_at || '').slice(11, 19);
+  return `<div class="thread ${klass}">
+    <div class="thread-header">
+      <p class="thread-title">${dec.symbol} signal</p>
+      <span class="thread-time">${time}</span>
+    </div>
+    <div class="msg">
+      <div class="avatar M">M</div>
+      <div class="msg-body">
+        <p class="msg-who"><span class="name">Manager</span><span class="time">${time}</span></p>
+        <div class="bubble M">${escape(dec.reason || 'Decided.')}</div>
+      </div>
+    </div>
+    <div class="msg">
+      <div class="avatar R">R</div>
+      <div class="msg-body">
+        <p class="msg-who"><span class="name">Research</span></p>
+        <div class="bubble R">${verdict}</div>
+      </div>
+    </div>
+    <div class="outcome ${outcomeClass}">
+      <span style="font-weight:500">${outcomeText}</span>
+      <span class="sm">cost $${totalCost.toFixed(4)}</span>
+    </div>
+  </div>`;
+}
+
+async function loadChat() {
+  try {
+    const d = await api('/api/messages?limit=50');
+    const log = $('chat-log');
+    if (!d.messages.length) {
+      log.innerHTML = '<div class="empty">No messages yet. Send the Manager your first directive.</div>';
+      return;
+    }
+    log.innerHTML = d.messages.map(m => {
+      const body = escape(m.body).replace(/\n/g, '<br>');
+      return `<div class="chat-msg ${m.sender}">
+        <p class="who">${m.sender === 'board' ? 'You' : (m.sender === 'manager' ? 'Manager' : 'System')} · ${(m.created_at||'').slice(11,16)}</p>
+        <div class="chat-bubble">${body}</div>
+      </div>`;
+    }).join('');
+    if (d.directives && d.directives.length) {
+      log.innerHTML += `<div class="chat-msg system" style="align-self:center"><div class="chat-bubble">${d.directives.length} active directives</div></div>`;
+    }
+    log.scrollTop = log.scrollHeight;
+  } catch (e) { console.error(e); }
+}
+
+async function sendChat() {
+  const text = $('chat-text').value.trim();
+  if (!text) return;
+  $('chat-text').value = '';
+  await api('/api/messages', {method: 'POST', body: JSON.stringify({body: text})});
+  loadChat();
+}
+
+async function loadControls() {
+  try {
+    const d = await api('/api/overview');
+    const r = await fetch('/api/messages?limit=1');  // warmup
+    const s = await api('/api/spend').catch(() => ({}));
+    // Pull latest control values
+    const ctrl = await fetch('/api/overview').then(r => r.json());
+    // Control parameters come via a dedicated endpoint; use overview -> ctrl
+    const c = (await fetch('/api/control-state').then(r => r.ok ? r.json() : null)) || {};
+    const mom = (c.momentum_threshold || 0.03) * 100;
+    const conf = c.confidence_threshold || 0.70;
+    const pos = c.max_position_usd || 1000;
+    $('mom-range').value = mom; $('mom-out').textContent = mom.toFixed(1);
+    $('conf-range').value = conf; $('conf-out').textContent = conf.toFixed(2);
+    $('pos-range').value = pos; $('pos-out').textContent = pos.toLocaleString();
+  } catch (e) { console.error(e); }
+}
+['mom', 'conf', 'pos'].forEach(k => {
+  const el = $(`${k}-range`);
+  if (el) el.addEventListener('input', e => {
+    if (k === 'mom') $(`${k}-out`).textContent = parseFloat(e.target.value).toFixed(1);
+    else if (k === 'conf') $(`${k}-out`).textContent = parseFloat(e.target.value).toFixed(2);
+    else $(`${k}-out`).textContent = parseInt(e.target.value).toLocaleString();
+  });
+});
+
+async function saveControls() {
+  const body = {
+    momentum_threshold: parseFloat($('mom-range').value) / 100,
+    confidence_threshold: parseFloat($('conf-range').value),
+    max_position_usd: parseFloat($('pos-range').value),
+  };
+  try {
+    await api('/api/control', {method: 'PATCH', body: JSON.stringify(body)});
+    alert('Saved. Takes effect next cycle.');
+  } catch (e) { alert('Failed: ' + e); }
+}
+
+async function loadSpend() {
+  try {
+    const d = await api('/api/spend');
+    const total = d.total || 0;
+    const cap = d.cap_total || 1.0;
+    $('sp-total').textContent = '$' + total.toFixed(4);
+    $('sp-cap').textContent = cap.toFixed(2);
+    $('sp-bar').style.width = Math.min(100, (total/cap)*100) + '%';
+    const bd = d.by_agent || {};
+    const caps = d.caps || {};
+    const lines = Object.entries(bd).map(([name, v]) => {
+      const cap = caps[name] || 0;
+      const pct = cap > 0 ? Math.min(100, (v/cap)*100) : 0;
+      return `<div class="row">
+        <span><span class="sym">${name}</span></span>
+        <span class="sm">$${v.toFixed(4)}${cap ? ` / $${cap.toFixed(2)}` : ''}</span>
+      </div>`;
+    }).join('');
+    $('sp-breakdown').innerHTML = lines || '<div class="empty">No spend recorded this week.</div>';
+  } catch (e) { $('sp-breakdown').innerHTML = `<div class="empty">Failed: ${e}</div>`; }
+}
+
+let halted = false;
+function setHalted(h, reason = '') {
+  halted = h;
+  const btn = $('stop-btn'), pill = $('status-pill');
+  if (h) {
+    btn.innerHTML = '▶ Resume operations';
+    btn.classList.add('btn-resume');
+    pill.innerHTML = '● halted';
+    pill.classList.add('halted');
+  } else {
+    btn.innerHTML = '■ Stop all operations';
+    btn.classList.remove('btn-resume');
+    pill.innerHTML = '● running';
+    pill.classList.remove('halted');
+  }
+}
+
+async function toggleHalt() {
+  try {
+    if (halted) await api('/api/resume', {method: 'POST'});
+    else        await api('/api/stop?reason=dashboard', {method: 'POST'});
+    loadOverview();
+  } catch (e) { alert('Failed: ' + e); }
+}
+
+function escape(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+loadOverview();
+setInterval(() => {
+  const active = document.querySelector('.panel.active').id;
+  if (active === 'overview') loadOverview();
+  if (active === 'ops') loadOps();
+  if (active === 'spend') loadSpend();
+}, 10000);
+</script>
+</body>
+</html>

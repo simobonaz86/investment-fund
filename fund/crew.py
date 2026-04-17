@@ -52,6 +52,7 @@ from fund.database import (
     spend_breakdown_last_week,
     weekly_spend,
 )
+from fund.market_data import pct_change
 from fund.schemas import (
     ExecutionResult,
     HiringPlan,
@@ -158,21 +159,16 @@ def detect_signals(ctrl: dict) -> list[dict]:
             log.debug("skip %s — on cooldown", symbol)
             continue
         try:
-            r = httpx.get(
-                f"{settings.market_sim_url}/v2/stocks/{symbol}/bars",
-                params={"limit": 65},
-                timeout=6.0,
-            )
-            r.raise_for_status()
-            bars = r.json().get("bars", [])
-            if len(bars) < 10:
-                continue
-
-            current  = bars[-1]["c"]
-            baseline = bars[0]["c"]
-            pct = (current - baseline) / baseline
-
+            pct = pct_change(symbol, lookback_bars=60)
             if abs(pct) >= ctrl["momentum_threshold"]:
+                # Get current price for context
+                from fund.market_data import get_quote
+                try:
+                    q = get_quote(symbol)
+                    current = (q["ap"] + q["bp"]) / 2.0
+                except Exception:
+                    current = 0.0
+
                 log.info("signal  %s  %+.2f%% → $%.4f", symbol, pct * 100, current)
                 signals.append({
                     "symbol":        symbol,
