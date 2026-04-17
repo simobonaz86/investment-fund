@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     # Hard per-cycle safety: don't let a rogue cycle drain the week
     max_cycle_spend_usd: float = 0.10
 
+    # ── Paper fund starting cash ──────────────────────────────────────────────
+    starting_cash_usd: float = 100_000.0
+
     # ── HTTP control port (for /stop and dashboard) ───────────────────────────
     control_port: int = 8002
 

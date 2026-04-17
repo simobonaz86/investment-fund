@@ -128,6 +128,12 @@ def init_db() -> None:
                 note        TEXT NOT NULL,
                 created_at  TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS cash (
+                id         INTEGER PRIMARY KEY CHECK (id = 1),
+                balance    REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """)
 
         existing = conn.execute("SELECT id FROM control WHERE id=1").fetchone()
@@ -146,6 +152,14 @@ def init_db() -> None:
                     settings.default_cooldown_minutes,
                     datetime.utcnow().isoformat(),
                 ),
+            )
+
+        # Seed starting cash (paper fund) — $100k
+        cash_row = conn.execute("SELECT id FROM cash WHERE id=1").fetchone()
+        if not cash_row:
+            conn.execute(
+                "INSERT INTO cash (id, balance, updated_at) VALUES (1, ?, ?)",
+                (settings.starting_cash_usd, datetime.utcnow().isoformat()),
             )
         conn.commit()
 
@@ -348,3 +362,37 @@ def get_portfolio() -> list[dict]:
             "SELECT * FROM portfolio WHERE quantity > 0.0001 ORDER BY symbol"
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ── Cash ─────────────────────────────────────────────────────────────────────
+
+def get_cash() -> float:
+    with get_connection() as conn:
+        row = conn.execute("SELECT balance FROM cash WHERE id=1").fetchone()
+        return float(row["balance"]) if row else 0.0
+
+
+def adjust_cash(delta: float) -> float:
+    """Add (positive) or remove (negative) cash. Returns new balance."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT balance FROM cash WHERE id=1").fetchone()
+        if not row:
+            raise RuntimeError("cash row missing — run init_db first")
+        new_bal = float(row["balance"]) + delta
+        conn.execute(
+            "UPDATE cash SET balance=?, updated_at=? WHERE id=1",
+            (new_bal, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return new_bal
+
+
+def reset_cash(amount: float) -> float:
+    """Reset the paper cash balance (used for a fund reset / testing)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE cash SET balance=?, updated_at=? WHERE id=1",
+            (amount, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return amount

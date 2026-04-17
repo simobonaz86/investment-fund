@@ -11,7 +11,7 @@ import httpx
 from crewai.tools import tool
 
 from fund.config import settings
-from fund.database import upsert_position
+from fund.database import upsert_position, adjust_cash, get_cash, read_control
 
 _SIM_URL = os.getenv("MARKET_SIM_URL", "http://localhost:8001")
 _SLIPPAGE = 0.0010    # 10 bp simulated slippage
@@ -39,10 +39,11 @@ def place_paper_order(symbol: str, direction: str, amount_usd: float) -> str:
     if amount_usd <= 0:
         return json.dumps({"status": "error", "message": "amount_usd must be positive"})
 
-    if amount_usd > settings.max_position_usd:
+    max_pos = read_control()["max_position_usd"]
+    if amount_usd > max_pos:
         return json.dumps({
             "status": "error",
-            "message": f"amount_usd {amount_usd:.2f} exceeds max allowed {settings.max_position_usd:.2f}",
+            "message": f"amount_usd {amount_usd:.2f} exceeds max allowed {max_pos:.2f}",
         })
 
     sym = symbol.strip().upper()
@@ -68,20 +69,33 @@ def place_paper_order(symbol: str, direction: str, amount_usd: float) -> str:
         quantity   = round(amount_usd / fill_price, 6)
         total_usd  = round(quantity * fill_price, 2)
 
-        # ── Update portfolio ───────────────────────────────────────────────────
+        # ── Cash check on BUY ─────────────────────────────────────────────────
+        if direction == "BUY":
+            current_cash = get_cash()
+            if current_cash < total_usd:
+                return json.dumps({
+                    "status":  "rejected",
+                    "message": f"insufficient cash: have ${current_cash:.2f}, need ${total_usd:.2f}",
+                })
+
+        # ── Update portfolio + cash ───────────────────────────────────────────
         delta = quantity if direction == "BUY" else -quantity
         upsert_position(sym, delta, fill_price)
 
+        cash_delta = -total_usd if direction == "BUY" else total_usd
+        new_cash = adjust_cash(cash_delta)
+
         # ── Build fill record ──────────────────────────────────────────────────
         fill = {
-            "status":     "filled",
-            "symbol":     sym,
-            "direction":  direction,
-            "fill_price": fill_price,
-            "quantity":   quantity,
-            "total_usd":  total_usd,
+            "status":       "filled",
+            "symbol":       sym,
+            "direction":    direction,
+            "fill_price":   fill_price,
+            "quantity":     quantity,
+            "total_usd":    total_usd,
+            "cash_remaining": round(new_cash, 2),
             "slippage_pct": _SLIPPAGE * 100,
-            "filled_at":  datetime.utcnow().isoformat() + "Z",
+            "filled_at":    datetime.utcnow().isoformat() + "Z",
         }
         return json.dumps(fill)
 
@@ -143,8 +157,10 @@ def get_portfolio_state() -> str:
             })
 
         return json.dumps({
+            "cash_balance":  round(get_cash(), 2),
             "positions":     positions,
-            "total_value":   round(total_value, 2),
+            "positions_market_value": round(total_value, 2),
+            "total_equity":  round(get_cash() + total_value, 2),
             "n_positions":   len(positions),
         })
 

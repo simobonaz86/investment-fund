@@ -22,8 +22,10 @@ from pydantic import BaseModel
 
 from fund.config   import settings
 from fund.database import (
+    get_cash,
     get_connection,
     read_control,
+    reset_cash,
     set_halted,
     spend_breakdown_last_week,
     update_control,
@@ -59,11 +61,17 @@ class ControlUpdate(BaseModel):
 def status():
     ctrl  = read_control()
     total = weekly_spend()
+    with get_connection() as conn:
+        positions = conn.execute(
+            "SELECT symbol, quantity, avg_cost FROM portfolio WHERE quantity > 0.0001"
+        ).fetchall()
     return {
         "control":      ctrl,
         "weekly_spend": round(total, 4),
         "weekly_cap":   settings.weekly_budget_total_usd,
         "pct_of_cap":   round(total / max(settings.weekly_budget_total_usd, 1e-9) * 100, 1),
+        "cash":         round(get_cash(), 2),
+        "n_positions": len(positions),
     }
 
 
@@ -126,3 +134,10 @@ def patch_control(update: ControlUpdate):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/fund/reset")
+def fund_reset(amount: float = 100_000.0):
+    """Reset paper cash to a given amount (default $100k)."""
+    new = reset_cash(amount)
+    return {"cash_balance": round(new, 2)}
