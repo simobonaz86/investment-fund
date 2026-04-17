@@ -228,6 +228,8 @@ Rules of thumb:
 
 Remember: Kevin (your Auditor) will review your final decision. Write reasoning he can follow.
 
+Keep `reason` under 3 sentences — dense and specific, not a memo.
+
 Return a HiringPlan.
 """,
         expected_output="A HiringPlan object.",

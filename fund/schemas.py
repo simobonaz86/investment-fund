@@ -1,7 +1,8 @@
 """
 Pydantic schemas for structured agent output.
-Length limits are generous — Sonnet writes richer justifications than Haiku,
-and we'd rather read the full reason than get a validation error.
+Length limits are generous — Sonnet-class models (especially with rich
+CEO/Kevin system prompts) write longer justifications than Haiku.
+We'd rather read the full reason than get a validation error.
 """
 from typing import Literal
 from pydantic import BaseModel, Field
@@ -10,13 +11,13 @@ from pydantic import BaseModel, Field
 class ResearchVerdict(BaseModel):
     verdict:    Literal["BUY", "SELL", "HOLD"]
     confidence: float = Field(ge=0.0, le=1.0)
-    reason:     str   = Field(max_length=500)
+    reason:     str   = Field(max_length=800)
 
 
 class RiskReport(BaseModel):
     assessment:           Literal["clear", "caution", "block"]
     recommended_size_usd: float = Field(ge=0.0)
-    reason:               str   = Field(max_length=500)
+    reason:               str   = Field(max_length=800)
 
 
 class HiringPlan(BaseModel):
@@ -24,7 +25,7 @@ class HiringPlan(BaseModel):
     hire_research:  bool
     hire_risk:      bool
     hire_sentiment: bool = False
-    reason:         str  = Field(max_length=500)
+    reason:         str  = Field(max_length=800)
 
 
 class ManagerDecision(BaseModel):
@@ -32,7 +33,7 @@ class ManagerDecision(BaseModel):
     trade:     bool
     direction: Literal["BUY", "SELL", "N/A"]
     size_usd:  float = Field(ge=0.0)
-    reason:    str   = Field(max_length=600)
+    reason:    str   = Field(max_length=1000)
 
 
 class ExecutionResult(BaseModel):
@@ -44,7 +45,7 @@ class ExecutionResult(BaseModel):
 
 class ReflectionNote(BaseModel):
     outcome: Literal["win", "loss", "breakeven", "pending"]
-    note:    str = Field(max_length=500)
+    note:    str = Field(max_length=800)
 
 
 # ── Phase 2.1: Governance schemas ─────────────────────────────────────────────
@@ -54,11 +55,10 @@ class CEOHiringPlan(BaseModel):
     hire_research:  bool
     hire_risk:      bool
     hire_sentiment: bool = False
-    # Model tier per hire — CEO's authority (weekly cap is the check)
     research_tier:  Literal["haiku", "sonnet", "opus"] = "haiku"
     risk_tier:      Literal["haiku", "sonnet", "opus"] = "haiku"
     sentiment_tier: Literal["haiku", "sonnet", "opus"] = "haiku"
-    reason:         str = Field(max_length=500)
+    reason:         str = Field(max_length=800)
 
 
 class KevinReview(BaseModel):
@@ -72,8 +72,8 @@ class KevinReview(BaseModel):
       • block       — trade halts until Board approves via dashboard
     """
     action:  Literal["pass", "flag_yellow", "flag_red", "block"]
-    reason:  str = Field(max_length=500)
-    concern_pattern: str | None = Field(default=None, max_length=200)
+    reason:  str = Field(max_length=800)
+    concern_pattern: str | None = Field(default=None, max_length=300)
 
 
 class KevinWeeklyAudit(BaseModel):
@@ -82,4 +82,4 @@ class KevinWeeklyAudit(BaseModel):
     wins:       list[str] = Field(default_factory=list, max_length=5)
     concerns:   list[str] = Field(default_factory=list, max_length=5)
     pattern_flags:     list[str] = Field(default_factory=list, max_length=5)
-    recommendation:    str = Field(max_length=600)
+    recommendation:    str = Field(max_length=1000)
