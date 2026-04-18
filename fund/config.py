@@ -1,76 +1,74 @@
-"""
-Fund configuration.
-Only values that should not change at runtime live here.
-Runtime-mutable knobs (thresholds, active assets, halt flag) live in the
-`control` table in SQLite and are read fresh on every cycle.
-"""
+"""Phase 2.2 config — extends Phase 2.1 with HR, budget splits, reports."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # ── API ───────────────────────────────────────────────────────────────────
-    anthropic_api_key: str = ""
+    # ── Core ────────────────────────────────────────────────────────────────
+    ANTHROPIC_API_KEY: str = Field(..., description="Anthropic API key")
+    DB_PATH: str = "/data/fund.db"
+    MARKET_SIM_URL: str = "http://market_sim:8001"
+    LOG_LEVEL: str = "INFO"
 
-    # ── Per-agent models ──────────────────────────────────────────────────────
-    # Phase 2.1: Two permanent agents — Board chooses these models.
-    # HR joins in Phase 2.2.
-    ceo_model:          str = "anthropic/claude-sonnet-4-6"
-    kevin_model:        str = "anthropic/claude-sonnet-4-6"   # Auditor needs good reasoning
+    # ── Principals (always-on agents) ───────────────────────────────────────
+    CEO_MODEL: str = "anthropic/claude-sonnet-4-5-20250929"
+    KEVIN_MODEL: str = "anthropic/claude-haiku-4-5-20251001"
+    HR_MODEL: str = "anthropic/claude-haiku-4-5-20251001"
+    SPECIALIST_DEFAULT_MODEL: str = "anthropic/claude-haiku-4-5-20251001"
 
-    # Legacy alias — some call sites still import manager_model
-    manager_model:      str = "anthropic/claude-sonnet-4-6"
+    # ── Monthly budget (USD, LLM spend only) ────────────────────────────────
+    MONTHLY_BUDGET_USD: float = 100.0
+    BUDGET_SPLIT_CEO: float = 0.70   # CEO pool (incl. specialists CEO hires)
+    BUDGET_SPLIT_HR: float = 0.15
+    BUDGET_SPLIT_KEVIN: float = 0.15
 
-    # Specialist defaults — CEO can override at runtime via agent_roster table.
-    research_model:     str = "anthropic/claude-haiku-4-5-20251001"
-    risk_model:         str = "anthropic/claude-haiku-4-5-20251001"
-    sentiment_model:    str = "anthropic/claude-haiku-4-5-20251001"
-    execution_model:    str = "anthropic/claude-haiku-4-5-20251001"
-    accountant_model:   str = "anthropic/claude-haiku-4-5-20251001"
-    reflection_model:   str = "anthropic/claude-haiku-4-5-20251001"
+    # ── Trading ─────────────────────────────────────────────────────────────
+    ASSETS: str = "SYN-A,SYN-B,SYN-C"
+    MOMENTUM_THRESHOLD: float = 0.03
+    CONFIDENCE_THRESHOLD: float = 0.70
+    MAX_POSITION_USD: float = 1000.0
+    CHECK_INTERVAL_SECONDS: int = 60
 
-    # ── Infra ─────────────────────────────────────────────────────────────────
-    market_sim_url: str = "http://localhost:8001"
-    db_path:        str = "data/fund.db"
+    # ── HR weekly cadence ───────────────────────────────────────────────────
+    HR_REVIEW_DAY: str = "MON"          # day of week
+    HR_REVIEW_HOUR_UTC: int = 9         # 09:00 UTC Monday
 
-    # ── Defaults seeded into the control table on first start ─────────────────
-    # Phase 2.1: real tickers. CEO can expand at runtime.
-    # Equities (US single stocks + ETFs) plus bond ETFs (TLT long Treasuries, IEF intermediate, HYG high-yield, LQD IG corporates).
-    default_assets_str:           str   = "NVDA,AMZN,GOOGL,META,VWRP,VUSA,TLT,IEF,HYG,LQD"
-    default_momentum_threshold:   float = 0.015
-    default_confidence_threshold: float = 0.70
-    default_max_position_usd:     float = 1000.0
-    default_check_interval:       int   = 120
-    default_cooldown_minutes:     int   = 30
+    # ── Reports schedule (UTC) ──────────────────────────────────────────────
+    DAILY_REPORT_HOUR: int = 18
+    WEEKLY_REPORT_DAY: str = "MON"
+    WEEKLY_REPORT_HOUR: int = 9
+    MONTHLY_REPORT_DAY: int = 1
+    MONTHLY_REPORT_HOUR: int = 9
+    BENCHMARK_SYMBOL: str = "SYN-A"     # used as simple benchmark
 
-    # ── Budget caps (hard limits, not runtime-mutable for safety) ─────────────
-    # Start at $1/week for testing.  Raise once Phase 1 is proven stable.
-    weekly_budget_total_usd:      float = 1.00
-    weekly_budget_research_usd:   float = 0.40
-    weekly_budget_risk_usd:       float = 0.20
-    weekly_budget_sentiment_usd:  float = 0.15
-    weekly_budget_execution_usd:  float = 0.10
-    weekly_budget_accountant_usd: float = 0.05
-    weekly_budget_reflection_usd: float = 0.10
+    # ── Dashboard ───────────────────────────────────────────────────────────
+    DASHBOARD_HOST: str = "0.0.0.0"
+    DASHBOARD_PORT: int = 8080
 
-    # Hard per-cycle safety: don't let a rogue cycle drain the week
-    max_cycle_spend_usd: float = 0.10
-
-    # ── Paper fund starting cash ──────────────────────────────────────────────
-    starting_cash_usd: float = 100_000.0
-
-    # ── HTTP control port (for /stop and dashboard) ───────────────────────────
-    control_port: int = 8002
+    # ── Kevin audit gate ────────────────────────────────────────────────────
+    KEVIN_DEBUG_GATE: bool = True  # enforce action surfacing on startup
 
     @property
-    def default_assets(self) -> List[str]:
-        return [a.strip() for a in self.default_assets_str.split(",")]
+    def assets_list(self) -> list[str]:
+        return [a.strip() for a in self.ASSETS.split(",") if a.strip()]
+
+    @property
+    def budget_ceo(self) -> float:
+        return round(self.MONTHLY_BUDGET_USD * self.BUDGET_SPLIT_CEO, 2)
+
+    @property
+    def budget_hr(self) -> float:
+        return round(self.MONTHLY_BUDGET_USD * self.BUDGET_SPLIT_HR, 2)
+
+    @property
+    def budget_kevin(self) -> float:
+        return round(self.MONTHLY_BUDGET_USD * self.BUDGET_SPLIT_KEVIN, 2)
 
 
 settings = Settings()

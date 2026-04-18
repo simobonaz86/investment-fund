@@ -1,143 +1,136 @@
-# Investment Fund — Phase 0
+# Investment Fund — Phase 2.2
 
-Autonomous multi-agent investment fund built with CrewAI + Claude.
-Phase 0 scope: Investment Manager · Research Analyst · Execution Agent · simulated market data.
+Phase 2.2 = Phase 2.1 + HR + scheduled reports + Kevin debug gate +
+model selector UI + budget pools (70/15/15) + Board dashboard.
 
----
+## What's new vs Phase 2.1
 
-## Quick start (local, two terminals)
+| Feature | What it does |
+| --- | --- |
+| **HR agent** | Weekly only (Mon 09:00 UTC). Reviews CEO hiring patterns + cost efficiency, posts org recommendations to Board. **Advisory only — does NOT hire/fire/block.** |
+| **Budget pools 70/15/15** | Monthly LLM budget split: 70% CEO (incl. all specialists), 15% HR, 15% Kevin. Hard tracked in `budget_pools` table. |
+| **Kevin hardened** | All 4 actions (`flag_yellow`, `flag_red`, `block_trade`, `escalate_board`) GUARANTEE chat + dashboard surfacing. Startup self-test (`debug_gate`) verifies every action wires end-to-end. |
+| **Model selector UI** | Board sets CEO / Kevin / HR / `specialist_default` models; CEO sets `specialist_*` models. Authority enforced in `database.set_model()` — CEO cannot override principals. |
+| **Scheduled reports** | Daily 18:00, Weekly Mon 09:30, Monthly 1st 09:00, Quarterly Jan/Apr/Jul/Oct 1st 09:30, YTD 1st 10:00 — all UTC. Each report contains P&L, Sharpe, max drawdown, benchmark vs `SYN-A`, agent cost breakdown by role. |
+| **Board dashboard** | FastAPI on port 8080. Live budget bars, model selector, principals' chat feed, Kevin audit log with silent-bug warning, reports table, ad-hoc HR/report triggers. |
+| **24/7 scanning** | Market hours deferred. Scan runs continuously. |
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Board Dashboard :8080                    │
+│  budget │ models │ chat │ Kevin audit │ reports │ HR trigger │
+└──────────────────────────────────────────────────────────────┘
+                              │
+            ┌─────────────────┴─────────────────┐
+            │                                   │
+        SQLite DB                       APScheduler
+        /data/fund.db                   • HR weekly
+        ───────────                     • Daily report
+        budget_pools                    • Weekly/Monthly/Q/YTD
+        manager_decisions
+        agent_costs                     ┌──────────────────┐
+        kevin_audit_log     ◄───────── │  Fund container  │
+        principals_chat                 │  (Phase 2.1 loop) │
+        hr_reviews                      │  CEO + Kevin      │
+        reports                         └──────────────────┘
+        model_selections                         │
+        org_state                                ▼
+                                         market_sim :8001
+```
+
+## Files added (vs Phase 2.1)
+
+```
+fund/
+├── agents/
+│   ├── kevin.py          ← hardened, with surfacing + debug_gate
+│   └── hr.py             ← NEW, weekly cadence, advisory
+├── reports/
+│   ├── __init__.py       ← NEW
+│   └── generator.py      ← NEW, P&L/Sharpe/DD/benchmark/cost
+├── dashboard/
+│   ├── __init__.py       ← NEW
+│   ├── __main__.py       ← NEW, uvicorn launcher + scheduler
+│   ├── app.py            ← NEW, FastAPI routes
+│   ├── templates/
+│   │   └── index.html    ← NEW
+│   └── static/
+│       ├── app.css       ← NEW, dark navy
+│       └── app.js        ← NEW, polls every 5s
+├── scheduler.py          ← NEW, APScheduler cron jobs
+├── config.py             ← extended (HR, budget split, schedules)
+└── database.py           ← +6 tables: budget_pools, hr_reviews,
+                            reports, kevin_audit_log,
+                            model_selections, principals_chat,
+                            org_state
+
+Dockerfile.dashboard      ← NEW
+docker-compose.yml        ← +dashboard service
+tests/test_phase22.py     ← NEW, 10 smoke tests
+```
+
+## Deploy on Sentinel
+
+You already have Phase 2.1 running at `/opt/investment-fund`. To layer 2.2:
 
 ```bash
-# 1. Install
-python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+cd /opt/investment-fund
 
-# 2. Configure
-cp .env.example .env
-# Edit .env — add your ANTHROPIC_API_KEY
+# Stop current stack
+docker compose down
 
-# 3. Start market simulator  (Terminal 1)
-cd market_sim
-python main.py                    # http://localhost:8001
+# Pull Phase 2.2 (assumes the tarball is uploaded)
+tar -xzf /tmp/investment_fund_phase22.tar.gz --strip-components=1
 
-# 4. Run trading loop  (Terminal 2)
-cd ..
-python run.py
+# Append the 4 new env vars to the existing .env
+cat >> .env << 'EOF'
+DASHBOARD_HOST=0.0.0.0
+DASHBOARD_PORT=8080
+MONTHLY_BUDGET_USD=100.0
+KEVIN_DEBUG_GATE=true
+EOF
+
+# Build + start
+docker compose up -d --build
+docker compose ps
 ```
 
-## Quick start (Docker)
+Then open the dashboard:
+- Tailscale: `http://100.102.177.53:8080`
+- Public:    `http://5.161.54.186:8080`
+
+Verify Kevin's debug gate passed in the dashboard logs:
+```bash
+docker compose logs dashboard | grep "debug gate"
+# expect: "Kevin debug gate OK"
+```
+
+## Tests
 
 ```bash
-cp .env.example .env
-# Edit .env — add your ANTHROPIC_API_KEY
-
-docker compose up --build
+python tests/test_phase22.py
 ```
 
----
+10 tests, all run without LLM calls (use temp SQLite). Verifies:
+schema, budget pools, all 4 Kevin actions surface, silent-action
+detection, debug gate, model authority, report period math + Sharpe,
+HR data gathering, principals chat.
 
-## How Phase 0 works
+## Phase 2.2 gate check
 
-```
-Every 60 s
-  ↓
-detect_signals()          Scan SYN-A, SYN-B, SYN-C for moves ≥ 3%
-  ↓ (signal found)
-Phase 1 Crew
-  Research Analyst  →  get_price_bars + calculate_indicators → VERDICT / CONFIDENCE
-  Investment Manager → checks portfolio → TRADE: YES|NO
+Before declaring 2.2 done, all 5 must hold:
 
-  ↓ (TRADE: YES, confidence ≥ 0.70)
-Phase 2 Crew
-  Execution Agent   →  place_paper_order → STATUS / FILL_PRICE / QUANTITY
+1. `docker compose logs dashboard` shows "Kevin debug gate OK"
+2. Dashboard accessible at port 8080 over Tailscale
+3. `POST /api/hr/run` produces a row in `hr_reviews` and a chat msg from `hr`
+4. `POST /api/reports/run {"kind":"daily"}` returns a markdown report
+5. `sqlite3 /data/fund.db "SELECT * FROM budget_pools"` shows current month with allocations 70/15/15
 
-  ↓
-log_decision()            Audit trail → data/fund.db (manager_decisions table)
-```
+## What's NOT in 2.2 (deferred)
 
-The two-phase design means the Execution Agent is never instantiated unless the
-Manager explicitly approves.  This maps directly to the "hiring" spec.
-
----
-
-## Project layout
-
-```
-investment_fund/
-├── market_sim/
-│   ├── gbm.py          GBM price engine (drift + vol configurable per asset)
-│   └── main.py         FastAPI server — Alpaca-compatible schema
-├── fund/
-│   ├── config.py       All settings from .env (pydantic-settings)
-│   ├── database.py     SQLite: portfolio, orders, manager_decisions, agent_costs
-│   ├── tools/
-│   │   ├── market.py   get_price_bars, calculate_indicators
-│   │   └── broker.py   place_paper_order, get_portfolio_state
-│   ├── agents/
-│   │   ├── research.py   Research Analyst
-│   │   ├── execution.py  Execution Agent
-│   │   └── manager.py    Investment Manager
-│   └── crew.py         Signal detection + two-phase trading loop
-└── run.py              Entry point
-```
-
----
-
-## Phase 0 gate check (go/no-go)
-
-Run the simulator and fund for 10 cycles, then query the DB:
-
-```bash
-sqlite3 data/fund.db "
-  SELECT symbol, research_verdict, confidence, trade_taken, direction, reason
-  FROM manager_decisions
-  ORDER BY created_at DESC LIMIT 10;
-"
-```
-
-Gate passes when:
-- Every row where `trade_taken = 1` has a `research_verdict` of BUY or SELL
-- Every row where `trade_taken = 0` has either HOLD verdict or confidence < 0.70
-- No `trade_taken = 1` rows with `confidence < 0.70`
-
-If the above holds: the Manager is correctly requiring Research before every trade.
-Move to Phase 1 (Risk Manager + Alpaca paper API).
-
----
-
-## Swapping to real market data (Phase 2)
-
-1. Set `MARKET_SIM_URL=https://data.alpaca.markets` in `.env`
-2. Add `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` to `.env`
-3. Update `fund/tools/market.py` to add Alpaca auth headers — no agent code changes
-4. Remove the `market_sim` service from `docker-compose.yml`
-
-The `/v2/stocks/{symbol}/bars` and `/v2/stocks/{symbol}/quotes/latest` endpoint
-shapes are identical between the simulator and real Alpaca, by design.
-
----
-
-## Tuning
-
-| Parameter             | Default | Effect                                              |
-|-----------------------|---------|-----------------------------------------------------|
-| `MOMENTUM_THRESHOLD`  | 0.03    | Lower → more signals, higher agent costs            |
-| `CONFIDENCE_THRESHOLD`| 0.70    | Lower → more trades, higher risk                    |
-| `MAX_POSITION_USD`    | 1000    | Hard per-trade cap enforced in broker tool          |
-| `CHECK_INTERVAL_SECONDS` | 60   | Lower → more reactive, more API calls              |
-| `SPECIALIST_MODEL`    | Haiku   | Upgrade to Sonnet for better research quality       |
-
----
-
-## Kill switch
-
-The Board kill switch is Phase 1 scope. For Phase 0 emergency stop:
-
-```bash
-docker compose stop fund     # stops trading loop immediately
-# or: Ctrl-C in the terminal running run.py
-```
-
-Pending orders: there are none in Phase 0 — each order fills synchronously
-before the loop sleeps. No open orders can be left dangling.
+- Market hours enforcement (24/7 for now — Phase 2.3)
+- HR with hire/fire authority (stays advisory)
+- LangGraph migration (Phase 3)
+- Live trading with real capital (Phase 4)

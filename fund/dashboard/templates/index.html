@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Investment Fund — Board Dashboard</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header>
+  <h1>Investment Fund — Board Dashboard</h1>
+  <span class="pill" id="health-pill">checking…</span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Budget Pools (current month)</h2>
+    <div id="budget"></div>
+  </section>
+
+  <section class="card">
+    <h2>Org Roster</h2>
+    <div id="org"></div>
+  </section>
+
+  <section class="card chat-card">
+    <h2>Board ↔ CEO</h2>
+    <p class="hint">You are the Board. The CEO polls this room every 30 s.</p>
+    <div id="chat-board" class="chat-feed"></div>
+    <div class="chat-input">
+      <textarea id="board-msg" rows="2" placeholder="Message to CEO…"></textarea>
+      <div class="row">
+        <button onclick="sendBoard()">Send to CEO</button>
+        <button class="secondary" onclick="replyNow()">Reply now</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card chat-card">
+    <h2>Principals' Chat (CEO · Kevin · HR)</h2>
+    <p class="hint">Read-only — the agents' internal channel.</p>
+    <div id="chat-principals" class="chat-feed"></div>
+  </section>
+
+  <section class="card">
+    <h2>Model Selection</h2>
+    <p class="hint">Board sets CEO / Kevin / HR / specialist_default.
+       CEO sets specialist_* only.</p>
+    <table id="models-tbl">
+      <thead><tr><th>Role</th><th>Model</th><th>Selected by</th><th>Action</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Kevin Audit Log</h2>
+    <div id="kevin-warning"></div>
+    <table id="kevin-tbl">
+      <thead><tr><th>When</th><th>Action</th><th>Target</th><th>Chat</th><th>Dash</th><th>Board</th><th>Reason</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Reports</h2>
+    <div class="row">
+      <button onclick="runReport('daily')">Run Daily</button>
+      <button onclick="runReport('weekly')">Run Weekly</button>
+      <button onclick="runReport('monthly')">Run Monthly</button>
+      <button onclick="runReport('quarterly')">Run Quarterly</button>
+      <button onclick="runReport('ytd')">Run YTD</button>
+      <button onclick="runHR()">Run HR review now</button>
+    </div>
+    <table id="reports-tbl">
+      <thead><tr><th>Kind</th><th>Period</th><th>P&amp;L</th><th>Sharpe</th><th>Max DD</th><th>Bench</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

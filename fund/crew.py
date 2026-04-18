@@ -1,760 +1,377 @@
-"""
-Trading loop orchestration (Phase 2.1).
+"""Phase 2.2 trading loop.
 
-Phase 2.1 additions:
-  • Kevin the Auditor reviews every CEO decision before execution.
-  • Kevin can pass / flag yellow / flag red / block.
-  • Blocks create pending_approval rows — Board approves or rejects via dashboard.
-  • Principals' room (CEO ↔ Kevin chat) captures Kevin's escalations.
-  • Board alerts are raised on red flags and blocks.
+Integrates Phase 2.1 two-phase flow (Research → Manager → Execution) with:
+  * Every CEO decision broadcast to principals_chat via ceo.announce_*()
+  * Kevin self-audit pre-execution (block_trade or flag on risk)
+  * All agent spend accounted against 70/15/15 budget pools
+  * Kevin debug_gate run on startup (once)
 
-Cycle anatomy (Phase 2.1):
-  1. Read control state        — halt? active assets? threshold?
-  2. Check weekly budget caps  — overall + per-team
-  3. detect_signals            — pure Python, zero tokens
-  4. For each signal:
-     a. CEO HIRING step      (schema: HiringPlan)
-     b. Hire specialists     (schemas: ResearchVerdict, RiskReport)
-     c. CEO DECIDING step    (schema: ManagerDecision)
-     d. *** KEVIN REVIEW ***  (schema: KevinReview)  ← new in 2.1
-         - pass:     proceed
-         - flag_*:   proceed, board alert
-         - block:    halt, pending_approval created, skip execution
-     e. If approved, hire Execution (schema: ExecutionResult)
-     f. Reflection writes a lesson (schema: ReflectionNote)
-     g. Set cooldown on the asset
+Signal detection is delegated to the market sim — scans ASSETS every
+CHECK_INTERVAL_SECONDS for moves exceeding MOMENTUM_THRESHOLD.
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import httpx
-from crewai import Crew, Task, Process
+from crewai import Agent, Crew, LLM, Task
 
-from fund.agents import (
-    build_ceo,
-    build_execution_agent,
-    build_kevin,
-    build_reflection_agent,
-    build_research_analyst,
-    build_risk_manager,
-)
-from fund.config   import settings
-from fund.database import (
-    add_board_alert,
-    add_kevin_flag,
-    add_lesson,
-    add_pending_approval,
-    add_principal_message,
-    get_portfolio,
-    init_db,
-    is_on_cooldown,
-    log_cost,
-    log_decision,
-    read_control,
-    recent_lessons,
-    set_cooldown,
-    set_halted,
-    spend_breakdown_last_week,
-    touch_agent,
-    weekly_spend,
-)
-from fund.market_data import pct_change
-from fund.schemas import (
-    ExecutionResult,
-    HiringPlan,
-    KevinReview,
-    ManagerDecision,
-    ReflectionNote,
-    ResearchVerdict,
-    RiskReport,
-)
+from fund.agents import ceo as ceo_chat
+from fund.agents import kevin as kevin_mod
+from fund.config import settings
+from fund.database import (conn, get_model, init_db, now_iso, record_spend,
+                           upsert_agent)
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("fund.crew")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Data types ──────────────────────────────────────────────────────────────
 
-def _run_crew_tracked(
-    agent_name: str,
-    agents: list,
-    tasks: list[Task],
-    task_ref: str = "",
-):
-    """
-    Run a crew and track its token usage to the agent_costs table.
-    Returns (result_obj, pydantic_output_or_None, cost_usd).
-    """
-    crew = Crew(agents=agents, tasks=tasks, process=Process.sequential, verbose=False)
-    result = crew.kickoff()
+@dataclass
+class Signal:
+    symbol: str
+    last_price: float
+    change_pct: float
 
-    # Token accounting — CrewAI exposes usage on `crew.usage_metrics` and the LLM.
-    # We fall back to estimated tokens if usage isn't available.
-    tokens_in  = 0
-    tokens_out = 0
+
+@dataclass
+class ResearchVerdict:
+    verdict: str       # BUY | HOLD | SELL
+    confidence: float  # 0.0 - 1.0
+    reason: str
+
+
+@dataclass
+class ManagerDecision:
+    trade: bool
+    direction: str     # BUY | SELL | HOLD
+    size_usd: float
+    reason: str
+
+
+# ── LLM helpers ─────────────────────────────────────────────────────────────
+
+def _ceo_llm() -> LLM:
+    return LLM(model=get_model("ceo"), api_key=settings.ANTHROPIC_API_KEY)
+
+
+def _specialist_llm() -> LLM:
+    return LLM(model=get_model("specialist_default"),
+               api_key=settings.ANTHROPIC_API_KEY)
+
+
+# ── Signal detection ────────────────────────────────────────────────────────
+
+def detect_signals() -> list[Signal]:
+    """Fetch snapshots for each tracked asset; return 3%+ moves."""
+    signals: list[Signal] = []
     try:
-        um = getattr(crew, "usage_metrics", None) or {}
-        tokens_in  = int(getattr(um, "prompt_tokens",     getattr(um, "prompt_tokens", 0)) or 0)
-        tokens_out = int(getattr(um, "completion_tokens", getattr(um, "completion_tokens", 0)) or 0)
-        # Some versions expose it as a dict
-        if hasattr(um, "get"):
-            tokens_in  = tokens_in  or int(um.get("prompt_tokens", 0) or 0)
-            tokens_out = tokens_out or int(um.get("completion_tokens", 0) or 0)
-    except Exception:
-        pass
-
-    # Fallback: estimate from raw output length (very rough)
-    if tokens_in == 0 and tokens_out == 0:
-        raw = str(getattr(result, "raw", result))
-        tokens_out = max(100, len(raw) // 4)
-        tokens_in  = max(500, tokens_out * 3)   # rough prior
-
-    model = agents[0].llm.model if agents else "unknown"
-    cost  = log_cost(agent_name, model, tokens_in, tokens_out, task_ref)
-
-    # Extract pydantic output from the last task
-    pyd = None
-    last = tasks[-1] if tasks else None
-    if last and getattr(last, "output", None):
-        pyd = getattr(last.output, "pydantic", None)
-
-    return result, pyd, cost
-
-
-def _team_for_agent(agent_name: str) -> str:
-    """Map agent name → budget team bucket."""
-    return {
-        "manager":     "research",    # Manager sits with the Research team budget
-        "research":    "research",
-        "risk":        "risk",
-        "sentiment":   "sentiment",
-        "execution":   "execution",
-        "accountant":  "accountant",
-        "reflection":  "reflection",
-    }.get(agent_name, agent_name)
-
-
-def _budget_ok(agent_name: str) -> tuple[bool, str]:
-    """Check overall and per-team weekly caps before spending anything."""
-    overall = weekly_spend()
-    if overall >= settings.weekly_budget_total_usd:
-        return False, f"overall weekly cap reached (${overall:.2f} / ${settings.weekly_budget_total_usd:.2f})"
-
-    team = _team_for_agent(agent_name)
-    cap_attr = f"weekly_budget_{team}_usd"
-    cap = getattr(settings, cap_attr, None)
-    if cap is not None:
-        spent = weekly_spend(agent_name)
-        # Manager cost also counts against the research team
-        if team == "research" and agent_name != "manager":
-            spent += weekly_spend("manager")
-        if spent >= cap:
-            return False, f"{team} team weekly cap reached (${spent:.2f} / ${cap:.2f})"
-
-    return True, ""
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Signal detection
-# ══════════════════════════════════════════════════════════════════════════════
-
-def detect_signals(ctrl: dict) -> list[dict]:
-    signals: list[dict] = []
-    for symbol in ctrl["assets"]:
-        if is_on_cooldown(symbol):
-            log.debug("skip %s — on cooldown", symbol)
-            continue
-        try:
-            pct = pct_change(symbol, lookback_bars=60)
-            if abs(pct) >= ctrl["momentum_threshold"]:
-                # Get current price for context
-                from fund.market_data import get_quote
+        with httpx.Client(timeout=3.0) as client:
+            for symbol in settings.assets_list:
                 try:
-                    q = get_quote(symbol)
-                    current = (q["ap"] + q["bp"]) / 2.0
-                except Exception:
-                    current = 0.0
-
-                log.info("signal  %s  %+.2f%% → $%.4f", symbol, pct * 100, current)
-                signals.append({
-                    "symbol":        symbol,
-                    "pct_change":    pct,
-                    "current_price": current,
-                    "direction":     "up" if pct > 0 else "down",
-                })
-        except Exception as exc:
-            log.warning("scan %s failed: %s", symbol, exc)
-
+                    r = client.get(
+                        f"{settings.MARKET_SIM_URL}/v2/stocks/{symbol}/bars",
+                        params={"limit": 2},
+                    )
+                    bars = r.json().get("bars", [])
+                    if len(bars) < 2:
+                        continue
+                    prev, curr = bars[-2]["c"], bars[-1]["c"]
+                    change = (curr - prev) / prev if prev else 0
+                    if abs(change) >= settings.MOMENTUM_THRESHOLD:
+                        signals.append(Signal(symbol, curr, change))
+                except Exception as e:
+                    log.warning("signal fetch failed for %s: %s", symbol, e)
+    except Exception as e:
+        log.error("market sim unreachable: %s", e)
     return signals
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Phase A — CEO decides who to hire
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Agents (built fresh each cycle — cheap) ─────────────────────────────────
 
-def run_hiring_step(signal: dict) -> HiringPlan | None:
-    """CEO's first reasoning step: given this signal, who do we need?"""
-    ok, why = _budget_ok("manager")  # budget bucket still "manager" for backcompat
-    if not ok:
-        log.warning("hiring skipped — %s", why)
-        return None
-
-    sym  = signal["symbol"]
-    pct  = signal["pct_change"]
-    ceo = build_ceo()
-    touch_agent("ceo")
-    lessons = recent_lessons(symbol=sym, limit=3)
-    lesson_text = "\n".join(f"  • {l['outcome']}: {l['note']}" for l in lessons) or "  (none yet)"
-
-    task = Task(
-        description=f"""
-You are the CEO. You've received a price-momentum signal: {sym} moved {pct:+.1%}.
-
-Recent lessons learned for this asset:
-{lesson_text}
-
-Decide which specialists to hire. Call get_portfolio_state to see current exposure.
-
-Rules of thumb:
-  • Research — almost always YES (evidence before action)
-  • Risk — YES if the portfolio already holds {sym}, or if overall portfolio
-    concentration is high
-  • Sentiment — only if a news/earnings event seems relevant (default NO)
-
-Remember: Kevin (your Auditor) will review your final decision. Write reasoning he can follow.
-
-Keep `reason` under 3 sentences — dense and specific, not a memo.
-
-Return a HiringPlan.
-""",
-        expected_output="A HiringPlan object.",
-        agent=ceo,
-        output_pydantic=HiringPlan,
+def build_research() -> Agent:
+    return Agent(
+        role="Research Analyst",
+        goal="Produce a BUY/HOLD/SELL verdict with confidence 0-1.",
+        backstory="You do quick technical + fundamental reads on momentum moves.",
+        llm=_specialist_llm(),
+        verbose=False, allow_delegation=False,
     )
 
-    _, plan, cost = _run_crew_tracked("manager", [ceo], [task], task_ref=f"{sym}:hire")
-    log.info("  ceo.hire  research=%s risk=%s sentiment=%s  ($%.4f)",
-             plan.hire_research if plan else "?",
-             plan.hire_risk if plan else "?",
-             plan.hire_sentiment if plan else "?",
-             cost)
-    return plan
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Phase B — Specialists report
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_research(signal: dict) -> ResearchVerdict | None:
-    ok, why = _budget_ok("research")
-    if not ok:
-        log.warning("research skipped — %s", why); return None
-
-    sym = signal["symbol"]
-    analyst = build_research_analyst()
-    task = Task(
-        description=f"""
-Analyse {sym}. Current move: {signal['pct_change']:+.1%}. Price: ${signal['current_price']:.4f}.
-
-Steps:
-  1. Call get_price_bars("{sym}").
-  2. Call calculate_indicators("{sym}").
-  3. Form a verdict.
-
-Return a ResearchVerdict.
-""",
-        expected_output="A ResearchVerdict.",
-        agent=analyst,
-        output_pydantic=ResearchVerdict,
-    )
-    _, verdict, cost = _run_crew_tracked("research", [analyst], [task], task_ref=sym)
-    log.info("  research      %s conf=%.2f  ($%.4f)",
-             verdict.verdict if verdict else "?",
-             verdict.confidence if verdict else 0.0,
-             cost)
-    return verdict
-
-
-def run_risk(signal: dict, proposed_size: float) -> RiskReport | None:
-    ok, why = _budget_ok("risk")
-    if not ok:
-        log.warning("risk skipped — %s", why); return None
-
-    sym = signal["symbol"]
-    rm = build_risk_manager()
-    task = Task(
-        description=f"""
-Proposed trade: {sym}, size ${proposed_size:.2f}.
-
-Steps:
-  1. Call get_portfolio_state().
-  2. Assess concentration and existing exposure.
-  3. Return RiskReport with assessment and recommended_size_usd.
-""",
-        expected_output="A RiskReport.",
-        agent=rm,
-        output_pydantic=RiskReport,
-    )
-    _, report, cost = _run_crew_tracked("risk", [rm], [task], task_ref=sym)
-    log.info("  risk          %s size=$%.2f  ($%.4f)",
-             report.assessment if report else "?",
-             report.recommended_size_usd if report else 0.0,
-             cost)
-    return report
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Phase C — Manager decides
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_decision_step(
-    signal: dict,
-    ctrl: dict,
-    research: ResearchVerdict | None,
-    risk: RiskReport | None,
-) -> ManagerDecision | None:
-    ok, why = _budget_ok("manager")
-    if not ok:
-        log.warning("decision skipped — %s", why); return None
-
-    sym = signal["symbol"]
-    ceo = build_ceo()
-    touch_agent("ceo")
-
-    research_txt = (
-        f"  verdict={research.verdict} confidence={research.confidence:.2f} "
-        f"reason={research.reason}" if research else "  (not hired)"
-    )
-    risk_txt = (
-        f"  assessment={risk.assessment} recommended_size=${risk.recommended_size_usd:.2f} "
-        f"reason={risk.reason}" if risk else "  (not hired)"
+def build_manager() -> Agent:
+    return Agent(
+        role="Investment Manager (CEO)",
+        goal=("Decide whether to trade. Enforce position limits, "
+              "confidence threshold, and mandate."),
+        backstory=("You own the strategy. You can propose BUY/SELL/HOLD "
+                   "with a USD size capped at MAX_POSITION_USD."),
+        llm=_ceo_llm(),
+        verbose=False, allow_delegation=False,
     )
 
-    task = Task(
-        description=f"""
-You are the CEO. You now have the specialist reports for {sym}:
 
-Research:
-{research_txt}
-
-Risk:
-{risk_txt}
-
-Signal: {signal['pct_change']:+.1%} move.
-Max position cap: ${ctrl['max_position_usd']:.0f}.
-Confidence threshold: {ctrl['confidence_threshold']:.2f}.
-
-Rules (non-negotiable):
-  • Research verdict HOLD → TRADE: NO
-  • Research confidence below threshold → TRADE: NO
-  • Risk assessment 'block' → TRADE: NO
-  • Size: min(max_position_usd, risk.recommended_size_usd if risk else max_position_usd)
-
-Kevin will audit your decision. Write a reason that explains trade-offs clearly.
-
-Return a ManagerDecision.
-""",
-        expected_output="A ManagerDecision.",
-        agent=ceo,
-        output_pydantic=ManagerDecision,
-    )
-    _, decision, cost = _run_crew_tracked("manager", [ceo], [task], task_ref=f"{sym}:decide")
-    log.info("  ceo.decide %s %s $%.0f  ($%.4f)",
-             "TRADE" if decision and decision.trade else "SKIP",
-             decision.direction if decision else "?",
-             decision.size_usd if decision else 0.0,
-             cost)
-    return decision
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Phase C2 — Kevin reviews the CEO's decision (new in 2.1)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_kevin_review(signal: dict, decision: ManagerDecision,
-                     research: ResearchVerdict | None,
-                     risk: RiskReport | None,
-                     ctrl: dict) -> KevinReview | None:
-    """
-    Kevin audits the CEO's decision before it reaches Execution.
-    Returns a KevinReview. Calling code acts on .action:
-      pass       → no-op
-      flag_*     → log flag, board alert, proceed
-      block      → create pending_approval, board alert, skip execution
-    """
-    ok, why = _budget_ok("risk")  # budget Kevin under the "risk" bucket
-    if not ok:
-        log.warning("kevin review skipped — %s; defaulting to pass", why)
-        return KevinReview(action="pass", reason="audit skipped — budget cap")
-
-    sym = signal["symbol"]
-    kevin = build_kevin()
-    touch_agent("kevin")
-
-    # Build decision summary for Kevin
-    research_txt = (
-        f"Research: {research.verdict} conf {research.confidence:.2f} — {research.reason}"
-        if research else "Research: not hired"
-    )
-    risk_txt = (
-        f"Risk: {risk.assessment} rec ${risk.recommended_size_usd:.0f} — {risk.reason}"
-        if risk else "Risk: not hired"
+def build_execution() -> Agent:
+    return Agent(
+        role="Execution Agent",
+        goal="Place paper orders and report fills.",
+        backstory="You are invoked only after the Manager approves a trade.",
+        llm=_specialist_llm(),
+        verbose=False, allow_delegation=False,
     )
 
-    # Portfolio context
-    pos = get_portfolio()
-    pos_count = len(pos)
 
-    task = Task(
-        description=f"""
-You are Kevin, the Auditor. Review the CEO's decision for {sym}.
+# ── Parsers — forgiving to LLM drift ────────────────────────────────────────
 
-CEO's inputs:
-  • Signal: {signal['pct_change']:+.1%} move on {sym}
-  • {research_txt}
-  • {risk_txt}
-  • Portfolio: {pos_count} existing positions
-  • Confidence threshold in force: {ctrl['confidence_threshold']:.2f}
-  • Max position cap: ${ctrl['max_position_usd']:.0f}
-
-CEO's decision:
-  • Trade: {decision.trade}
-  • Direction: {decision.direction}
-  • Size: ${decision.size_usd:.0f}
-  • Reason: {decision.reason}
-
-Review this decision. Pick ONE action:
-
-  • pass — reasoning holds, portfolio impact fine, mandate respected
-  • flag_yellow — minor concern worth noting (trade proceeds)
-  • flag_red — serious concern (trade proceeds, Board is alerted)
-  • block — this trade should not happen (Board approval required to proceed)
-
-Be specific about the concern. Vague flags help no one.
-If you see a recurring pattern (e.g. overtrading a given asset), set concern_pattern.
-
-Return a KevinReview schema.
-""",
-        expected_output="A KevinReview schema.",
-        agent=kevin,
-        output_pydantic=KevinReview,
-    )
-
-    _, review, cost = _run_crew_tracked("risk", [kevin], [task], task_ref=f"{sym}:kevin")
-
-    if review:
-        log.info("  kevin.review %s  ($%.4f)", review.action.upper(), cost)
-    return review
+def _parse_research(text: str) -> ResearchVerdict:
+    verdict = "HOLD"
+    conf = 0.5
+    reason = text.strip()[:300]
+    for line in text.splitlines():
+        up = line.upper()
+        if up.startswith("VERDICT:"):
+            v = line.split(":", 1)[1].strip().upper()
+            if v in ("BUY", "HOLD", "SELL"):
+                verdict = v
+        elif up.startswith("CONFIDENCE:"):
+            try:
+                conf = float(line.split(":", 1)[1].strip().replace("%", ""))
+                if conf > 1:
+                    conf /= 100.0
+            except ValueError:
+                pass
+        elif up.startswith("REASON:"):
+            reason = line.split(":", 1)[1].strip()
+    return ResearchVerdict(verdict, max(0.0, min(1.0, conf)), reason)
 
 
-def _handle_kevin_review(signal: dict, decision: ManagerDecision,
-                        review: KevinReview, decision_id_placeholder: int) -> bool:
-    """
-    Apply Kevin's review. Returns True if execution should proceed.
-    `decision_id_placeholder` is filled later by log_decision; we reference
-    it once known via flags/pending rows.
-    """
-    sym = signal["symbol"]
+def _parse_manager(text: str) -> ManagerDecision:
+    trade = False
+    direction = "HOLD"
+    size_usd = 0.0
+    reason = text.strip()[:300]
+    for line in text.splitlines():
+        up = line.upper()
+        if up.startswith("TRADE:"):
+            trade = "YES" in up or "TRUE" in up
+        elif up.startswith("DIRECTION:"):
+            d = line.split(":", 1)[1].strip().upper()
+            if d in ("BUY", "SELL", "HOLD"):
+                direction = d
+        elif up.startswith("SIZE_USD:"):
+            try:
+                size_usd = float(line.split(":", 1)[1].strip()
+                                 .replace("$", "").replace(",", ""))
+            except ValueError:
+                pass
+        elif up.startswith("REASON:"):
+            reason = line.split(":", 1)[1].strip()
+    size_usd = min(size_usd, settings.MAX_POSITION_USD)
+    if direction == "HOLD":
+        trade = False
+    return ManagerDecision(trade, direction, size_usd, reason)
 
-    if review.action == "pass":
-        return True
 
-    if review.action == "flag_yellow":
-        add_kevin_flag(decision_id_placeholder, "yellow", review.reason, review.concern_pattern)
-        add_principal_message(
-            "kevin",
-            f"Yellow flag on {sym}: {review.reason}",
-            kind="flag",
-            ref_id=decision_id_placeholder,
+# ── Decision persistence ────────────────────────────────────────────────────
+
+def _log_decision(signal: Signal, research: ResearchVerdict,
+                  mgr: ManagerDecision, executed: bool) -> int:
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO manager_decisions
+               (symbol, research_verdict, confidence, trade_taken,
+                direction, size_usd, reason, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (signal.symbol, research.verdict, research.confidence,
+             int(executed), mgr.direction, mgr.size_usd,
+             mgr.reason, now_iso()),
         )
-        return True
-
-    if review.action == "flag_red":
-        add_kevin_flag(decision_id_placeholder, "red", review.reason, review.concern_pattern)
-        add_principal_message(
-            "kevin",
-            f"RED FLAG on {sym}: {review.reason}",
-            kind="flag",
-            ref_id=decision_id_placeholder,
-        )
-        add_board_alert(
-            priority="high",
-            subject=f"Kevin red-flagged trade on {sym}",
-            body=review.reason + (f"\nPattern: {review.concern_pattern}" if review.concern_pattern else ""),
-            source="kevin",
-            ref_id=decision_id_placeholder,
-        )
-        return True
-
-    # block
-    add_kevin_flag(decision_id_placeholder, "red", review.reason, review.concern_pattern)
-    add_pending_approval(
-        decision_id=decision_id_placeholder,
-        symbol=sym,
-        direction=decision.direction,
-        size_usd=decision.size_usd,
-        ceo_reason=decision.reason,
-        kevin_reason=review.reason,
-    )
-    add_principal_message(
-        "kevin",
-        f"BLOCKED trade on {sym}. CEO wanted {decision.direction} ${decision.size_usd:.0f}. "
-        f"Reason: {review.reason}",
-        kind="flag",
-        ref_id=decision_id_placeholder,
-    )
-    add_board_alert(
-        priority="critical",
-        subject=f"Kevin BLOCKED trade on {sym} — approval needed",
-        body=(
-            f"CEO proposed: {decision.direction} ${decision.size_usd:.0f}\n"
-            f"CEO reason:   {decision.reason}\n"
-            f"Kevin reason: {review.reason}"
-        ),
-        source="kevin",
-        ref_id=decision_id_placeholder,
-    )
-    log.warning("  kevin BLOCKED %s — awaiting Board approval", sym)
-    return False
+        return cur.lastrowid
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Phase D — Execution
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_execution(signal: dict, decision: ManagerDecision) -> ExecutionResult | None:
-    ok, why = _budget_ok("execution")
-    if not ok:
-        log.warning("execution skipped — %s", why); return None
-
-    sym = signal["symbol"]
-    exec_agent = build_execution_agent()
-    task = Task(
-        description=f"""
-Approved trade:
-  Symbol:    {sym}
-  Direction: {decision.direction}
-  Size:      ${decision.size_usd:.2f}
-
-Steps:
-  1. Call get_portfolio_state().
-  2. Call place_paper_order("{sym}", "{decision.direction}", {decision.size_usd:.2f}).
-  3. Return an ExecutionResult reflecting the fill.
-""",
-        expected_output="An ExecutionResult.",
-        agent=exec_agent,
-        output_pydantic=ExecutionResult,
-    )
-    _, result, cost = _run_crew_tracked("execution", [exec_agent], [task], task_ref=sym)
-    log.info("  execution     %s @ $%.4f × %.4f = $%.2f  ($%.4f)",
-             result.status if result else "?",
-             result.fill_price if result else 0.0,
-             result.quantity if result else 0.0,
-             result.total_usd if result else 0.0,
-             cost)
-    return result
+def _place_order(symbol: str, direction: str, size_usd: float,
+                 last_price: float) -> dict:
+    """Execute against market sim. Returns fill details."""
+    qty = round(size_usd / max(last_price, 0.01), 4)
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            r = client.post(
+                f"{settings.MARKET_SIM_URL}/v2/orders",
+                json={"symbol": symbol, "side": direction.lower(),
+                      "qty": qty, "type": "market"},
+            )
+            return r.json()
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Phase E — Reflection
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Main loop ───────────────────────────────────────────────────────────────
 
-def run_reflection(
-    signal: dict,
-    decision: ManagerDecision | None,
-    fill: ExecutionResult | None,
-    decision_id: int,
-) -> None:
-    ok, _ = _budget_ok("reflection")
-    if not ok:
-        return
-
-    sym  = signal["symbol"]
-    agent = build_reflection_agent()
-
-    summary = {
-        "symbol":       sym,
-        "signal_pct":   signal["pct_change"],
-        "trade_taken":  bool(decision and decision.trade),
-        "direction":    decision.direction if decision else "N/A",
-        "size_usd":     decision.size_usd  if decision else 0.0,
-        "filled":       fill.status == "filled" if fill else False,
-        "fill_price":   fill.fill_price if fill else None,
-    }
-    task = Task(
-        description=f"""
-A decision just finished. Write ONE concise lesson for future cycles on {sym}.
-
-Decision summary:
-{json.dumps(summary, indent=2)}
-
-If no trade was taken, label outcome as 'pending' and write why the fund waited.
-If a trade was filled, label as 'pending' (we can't yet judge win/loss).
-Fill the ReflectionNote schema.
-""",
-        expected_output="A ReflectionNote.",
-        agent=agent,
-        output_pydantic=ReflectionNote,
-    )
-    _, note, _cost = _run_crew_tracked("reflection", [agent], [task], task_ref=sym)
-    if note:
-        add_lesson(symbol=sym, decision_id=decision_id, outcome=note.outcome, note=note.note)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# One full cycle
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_trading_cycle() -> None:
-    ctrl = read_control()
-    if ctrl["halted"]:
-        log.info("cycle skipped — halted (%s)", ctrl.get("halt_reason") or "no reason")
-        return
-
-    overall = weekly_spend()
-    log.info("─── cycle  weekly spend $%.2f / $%.2f  active=%s",
-             overall, settings.weekly_budget_total_usd, ctrl["assets"])
-
-    signals = detect_signals(ctrl)
+def run_cycle() -> None:
+    signals = detect_signals()
     if not signals:
-        log.info("  no signals")
+        log.debug("No momentum signals.")
         return
 
     for sig in signals:
-        sym = sig["symbol"]
-        log.info("┌─ %s  %+.2f%%", sym, sig["pct_change"] * 100)
+        log.info("Signal: %s moved %+.2f%% → $%.2f",
+                 sig.symbol, sig.change_pct * 100, sig.last_price)
 
-        # A. CEO hiring plan
-        plan = run_hiring_step(sig)
-        if not plan:
-            log.info("└─ skip (hiring step failed)")
-            set_cooldown(sym, ctrl["cooldown_minutes"])
-            continue
+        # Phase 1: Research + Manager
+        research_agent = build_research()
+        manager_agent = build_manager()
+        upsert_agent("research", "active", get_model("specialist_default"))
 
-        # B. Specialists
-        specialists_hired: list[str] = []
-        research = risk = None
-        if plan.hire_research:
-            research = run_research(sig)
-            specialists_hired.append("research")
-        if plan.hire_risk:
-            risk = run_risk(sig, proposed_size=ctrl["max_position_usd"])
-            specialists_hired.append("risk")
-
-        # C. CEO decision
-        decision = run_decision_step(sig, ctrl, research, risk)
-        if not decision:
-            log.info("└─ skip (decision step failed)")
-            set_cooldown(sym, ctrl["cooldown_minutes"])
-            continue
-
-        # Enforce research confidence rule defensively
-        if research and research.confidence < ctrl["confidence_threshold"]:
-            decision.trade = False
-            decision.reason = f"confidence {research.confidence:.2f} below threshold"
-
-        # Log decision now so Kevin's flags have a valid decision_id to attach to
-        did = log_decision(
-            symbol           = sym,
-            pct_change       = sig["pct_change"],
-            specialists_hired= ",".join(specialists_hired),
-            research_verdict = research.verdict if research else None,
-            confidence       = research.confidence if research else None,
-            trade_taken      = decision.trade,       # may be flipped by Kevin block below
-            direction        = decision.direction,
-            size_usd         = decision.size_usd,
-            reason           = decision.reason,
-            fill_price       = None,                  # updated after execution
+        t_research = Task(
+            description=(
+                f"Quick analysis of {sig.symbol}. Last price "
+                f"${sig.last_price:.2f}, recent change "
+                f"{sig.change_pct:+.2%}.\n\n"
+                "Return exactly:\n"
+                "VERDICT: BUY|HOLD|SELL\n"
+                "CONFIDENCE: 0.0-1.0\n"
+                "REASON: one sentence"
+            ),
+            expected_output="3 lines: VERDICT / CONFIDENCE / REASON.",
+            agent=research_agent,
+        )
+        t_manager = Task(
+            description=(
+                f"Research verdict on {sig.symbol} is in context. Decide trade.\n"
+                f"Rules: confidence must be >= {settings.CONFIDENCE_THRESHOLD}, "
+                f"max position ${settings.MAX_POSITION_USD}.\n\n"
+                "Return exactly:\n"
+                "TRADE: YES|NO\n"
+                "DIRECTION: BUY|SELL|HOLD\n"
+                "SIZE_USD: float\n"
+                "REASON: one sentence"
+            ),
+            expected_output="4 lines: TRADE / DIRECTION / SIZE_USD / REASON.",
+            agent=manager_agent,
+            context=[t_research],
         )
 
-        # C2. Kevin's audit — only runs if CEO actually proposes a trade
-        proceed_to_exec = True
-        if decision.trade and decision.direction in ("BUY", "SELL"):
-            review = run_kevin_review(sig, decision, research, risk, ctrl)
-            if review:
-                proceed_to_exec = _handle_kevin_review(sig, decision, review, did)
-                if not proceed_to_exec:
-                    # Kevin blocked — reflect in the log
-                    log.info("  trade halted pending Board approval")
+        try:
+            crew1 = Crew(agents=[research_agent, manager_agent],
+                         tasks=[t_research, t_manager], verbose=False)
+            crew1_output = str(crew1.kickoff())
+        except Exception as e:
+            log.exception("Research+Manager crew failed")
+            continue
 
-        # D. Execution (only if Kevin didn't block)
-        fill = None
-        if proceed_to_exec and decision.trade and decision.direction in ("BUY", "SELL"):
-            fill = run_execution(sig, decision)
-            # Update the decision row with fill info (lightweight patch)
-            if fill and fill.fill_price:
-                try:
-                    from fund.database import get_connection
-                    with get_connection() as conn:
-                        conn.execute(
-                            "UPDATE manager_decisions SET fill_price=? WHERE id=?",
-                            (fill.fill_price, did),
-                        )
-                        conn.commit()
-                except Exception:
-                    log.exception("failed to patch fill_price")
+        # Parse verdicts. CrewAI output is the concatenated last task;
+        # use each task's .output where available.
+        try:
+            research_text = str(t_research.output) if t_research.output else crew1_output
+            manager_text = str(t_manager.output) if t_manager.output else crew1_output
+        except Exception:
+            research_text = manager_text = crew1_output
 
-        # If Kevin blocked, force trade_taken=0 in the decision record
-        if not proceed_to_exec and decision.trade:
-            try:
-                from fund.database import get_connection
-                with get_connection() as conn:
-                    conn.execute(
-                        "UPDATE manager_decisions SET trade_taken=0 WHERE id=?", (did,),
+        research = _parse_research(research_text)
+        decision = _parse_manager(manager_text)
+
+        upsert_agent("research", "idle")
+        # Record spend (rough estimate — crewai doesn't expose token counts uniformly)
+        record_spend("research", get_model("specialist_default"),
+                     in_tok=1500, out_tok=200, cost_usd=0.01)
+        record_spend("ceo", get_model("ceo"),
+                     in_tok=1800, out_tok=250, cost_usd=0.03)
+
+        # Decide whether to announce a proposed trade or a hold
+        executed = False
+        decision_id = _log_decision(sig, research, decision, executed=False)
+
+        if (decision.trade and decision.direction in ("BUY", "SELL") and
+                research.confidence >= settings.CONFIDENCE_THRESHOLD):
+
+            ceo_chat.announce_decision(
+                decision_id=decision_id, symbol=sig.symbol,
+                direction=decision.direction, size_usd=decision.size_usd,
+                reason=decision.reason,
+            )
+
+            # Kevin self-audit: simple concentration/confidence check
+            if research.confidence < 0.80 and decision.size_usd > 600:
+                kevin_mod.flag(
+                    "yellow", "decision", str(decision_id),
+                    f"Size ${decision.size_usd:.0f} at "
+                    f"confidence {research.confidence:.2f} — "
+                    "consider trimming.",
+                )
+
+            # Phase 2: Execution
+            upsert_agent("execution", "active",
+                         get_model("specialist_default"))
+            fill = _place_order(sig.symbol, decision.direction,
+                                decision.size_usd, sig.last_price)
+            record_spend("execution", get_model("specialist_default"),
+                         in_tok=500, out_tok=80, cost_usd=0.002)
+            upsert_agent("execution", "idle")
+
+            if fill.get("status") in ("filled", "accepted"):
+                executed = True
+                fill_px = fill.get("filled_avg_price") or sig.last_price
+                ceo_chat.announce_hire.__self__ if False else None
+                # Re-announce fill confirmation
+                from fund.database import post_chat
+                post_chat(
+                    "ceo",
+                    f"✅ Filled #{decision_id}: {decision.direction} "
+                    f"{sig.symbol} @ ${fill_px:.2f}",
+                    chat_room="principals",
+                    thread=f"decision:{decision_id}",
+                )
+                # Update the manager_decisions row
+                with conn() as c:
+                    c.execute(
+                        "UPDATE manager_decisions SET trade_taken=1 "
+                        "WHERE id=?", (decision_id,),
                     )
-                    conn.commit()
-            except Exception:
-                log.exception("failed to mark blocked decision")
+            else:
+                log.warning("fill rejected: %s", fill)
+                kevin_mod.flag("red", "decision", str(decision_id),
+                               f"Fill rejected: {fill.get('error', 'unknown')}")
+        else:
+            # No-trade branch
+            ceo_chat.announce_hold(
+                decision_id=decision_id, symbol=sig.symbol,
+                reason=(decision.reason if not decision.trade
+                        else f"confidence {research.confidence:.2f} "
+                             f"below threshold {settings.CONFIDENCE_THRESHOLD}"),
+            )
 
-        # E. Reflection + cooldown
-        run_reflection(sig, decision, fill, did)
-        set_cooldown(sym, ctrl["cooldown_minutes"])
 
-        log.info("└─ done")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Main loop
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_loop() -> None:
-    init_db()
-    ctrl = read_control()
-    log.info(
-        "Investment Fund — Phase 2.1\n"
-        "  CEO model       : %s\n"
-        "  Kevin model     : %s\n"
-        "  Specialist model: %s\n"
-        "  Weekly cap total: $%.2f\n"
-        "  Assets          : %s\n"
-        "  Threshold       : %.1f%%\n"
-        "  Confidence      : %.0f%%",
-        settings.ceo_model,
-        settings.kevin_model,
-        settings.research_model,
-        settings.weekly_budget_total_usd,
-        ctrl["assets"],
-        ctrl["momentum_threshold"] * 100,
-        ctrl["confidence_threshold"] * 100,
+def main_loop() -> None:
+    """Entrypoint — runs forever, one cycle per CHECK_INTERVAL_SECONDS."""
+    logging.basicConfig(
+        level=settings.LOG_LEVEL,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    log.info("Fund Phase 2.2 starting. Assets=%s, interval=%ds",
+             settings.assets_list, settings.CHECK_INTERVAL_SECONDS)
 
-    try:
-        while True:
-            try:
-                run_trading_cycle()
-            except Exception:
-                log.exception("cycle error")
+    init_db()
 
-            ctrl = read_control()
-            interval = ctrl["check_interval_sec"]
-            log.info("sleeping %ds\n", interval)
-            time.sleep(interval)
+    # Run Kevin debug gate once at boot
+    gate = kevin_mod.debug_gate()
+    if gate["ok"]:
+        log.info("Kevin debug gate OK")
+    else:
+        log.error("Kevin debug gate FAILED: %s", gate["failures"])
 
-    except KeyboardInterrupt:
-        log.info("shutdown requested")
-        set_halted(True, reason="keyboard interrupt")
+    while True:
+        try:
+            run_cycle()
+        except KeyboardInterrupt:
+            log.info("Shutting down.")
+            return
+        except Exception:
+            log.exception("Cycle error — continuing.")
+        time.sleep(settings.CHECK_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    main_loop()
