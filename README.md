@@ -1,4 +1,60 @@
-# Investment Fund — Phase 2.2
+# Investment Fund — Phase 2.3
+
+**Phase 2.3 = Phase 2.2 + real market data via Yahoo Finance + per-asset
+momentum thresholds + exchange-hours gate.**
+
+## What's new vs Phase 2.2
+
+| Feature | What it does |
+| --- | --- |
+| **Yahoo Finance adapter** | `market_sim/yahoo.py` replaces the GBM engine. Fetches 1-minute bars from `yfinance`, caches per-symbol for 60 s, exposes the same Alpaca-compatible endpoints (`/v2/stocks/{sym}/bars`, `/quotes/latest`, `/snapshots`). When Yahoo is unreachable or a market is closed, `YahooEngine` serves stale cached data with `stale=True` on every quote. |
+| **Real asset universe** | 25 tickers spanning Simone's II + Revolut holdings — US single names (NVDA/TSM/GOOGL/META/AMZN), LSE ETFs (VWRP.L/VUSA.L/SSAC.L etc.), Xetra (5J50.DE), Copenhagen (MAERSK-B.CO), COMEX gold futures (GC=F), and BTC-USD. Full list in `fund/assets.py`. |
+| **Per-asset momentum thresholds** | Each ticker has its own `threshold` in `fund/assets.py` calibrated by asset class. Crypto (BTC) = 4%, broad ETFs = 1%, single stocks = 2–2.5%, sector ETFs = 1.5%. The global `MOMENTUM_THRESHOLD` env var is now just a fallback for unknown tickers. |
+| **Exchange-hours gate** | `fund/market_hours.py` blocks out-of-hours scans so Yahoo isn't hammered overnight. NYSE/NASDAQ, LSE, XETRA, CPH, COMEX (23h with daily break), CRYPTO (24/7). The scan runs every `CHECK_INTERVAL_SECONDS` but only spends API calls on tickers whose exchange is currently open. |
+| **Currency-aware universe** | Each asset declares its native currency (USD/GBP/EUR/DKK). Bars are passed through unchanged; the fund layer will handle conversion for aggregate P&L in Phase 2.4. |
+
+## Phase 2.3 deploy
+
+```bash
+cd /opt/investment-fund
+git pull                          # pull the Phase 2.3 code
+# Update .env with the full ASSETS list (see .env.example)
+docker compose down
+docker compose up -d --build
+docker compose logs -f market_sim  # should print:
+#   Initialising 25 engines: [...]
+#   NVDA: 95.3200 (live)
+#   VWRP.L: 132.2600 (live)
+#   etc.
+```
+
+If logs show `stale` instead of `live` outside market hours, that's expected
+— `detect_signals()` skips closed exchanges automatically.
+
+## Phase 2.3 gate check
+
+Once running, confirm the swap succeeded:
+
+```bash
+# 1) market_sim serves real quotes
+curl -s http://localhost:8001/health | python3 -m json.tool | head
+
+# 2) bars endpoint returns real OHLCV
+curl -s 'http://localhost:8001/v2/stocks/NVDA/bars?limit=3' | python3 -m json.tool
+
+# 3) fund container picks up per-asset thresholds
+docker compose logs fund | grep "Signal:"
+#   Signal: NVDA moved +2.34% over lookback (threshold 2.50%) → $95.8400
+#   Signal: BTC-USD moved +4.12% over lookback (threshold 4.00%) → $67423.00
+
+# 4) out-of-hours, signals pause (LSE closes 17:00 UTC)
+docker compose logs fund | grep "No exchanges open"
+```
+
+Gate passes when real bars flow through, signals respect per-asset thresholds,
+and no signals fire on closed exchanges.
+
+---
 
 Phase 2.2 = Phase 2.1 + HR + scheduled reports + Kevin debug gate +
 model selector UI + budget pools (70/15/15) + Board dashboard.

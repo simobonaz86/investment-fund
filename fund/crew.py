@@ -21,9 +21,11 @@ from crewai import Agent, Crew, LLM, Task
 
 from fund.agents import ceo as ceo_chat
 from fund.agents import kevin as kevin_mod
+from fund.assets import ASSETS as ASSET_META, threshold_for
 from fund.config import settings
 from fund.database import (conn, get_model, init_db, now_iso, record_spend,
                            upsert_agent)
+from fund.market_hours import filter_open, is_open
 
 log = logging.getLogger("fund.crew")
 
@@ -66,23 +68,44 @@ def _specialist_llm() -> LLM:
 # ── Signal detection ────────────────────────────────────────────────────────
 
 def detect_signals() -> list[Signal]:
-    """Fetch snapshots for each tracked asset; return 3%+ moves."""
+    """Scan open exchanges for assets that moved beyond their own threshold.
+
+    Per-asset changes vs. Phase 2.2:
+      * Each asset has its own momentum threshold (see fund/assets.py)
+      * Exchanges closed right now are skipped entirely (no Yahoo call wasted)
+      * Lookback uses the last 60 bars (≈1 hour of 1-min data) vs adjacent 2
+        bars — real 1-min moves are noisy; hour-scale moves are the actual
+        signal.
+      * Stale data (market closed, weekend) is filtered out by the sim and by
+        the scanner.
+    """
     signals: list[Signal] = []
+    universe = settings.assets_list
+    open_tickers = filter_open(universe)
+    if not open_tickers:
+        log.debug("No exchanges open — skipping scan")
+        return signals
+
     try:
-        with httpx.Client(timeout=3.0) as client:
-            for symbol in settings.assets_list:
+        with httpx.Client(timeout=5.0) as client:
+            for symbol in open_tickers:
                 try:
                     r = client.get(
                         f"{settings.MARKET_SIM_URL}/v2/stocks/{symbol}/bars",
-                        params={"limit": 2},
+                        params={"limit": 65},
                     )
                     bars = r.json().get("bars", [])
-                    if len(bars) < 2:
+                    if len(bars) < 10:
                         continue
-                    prev, curr = bars[-2]["c"], bars[-1]["c"]
-                    change = (curr - prev) / prev if prev else 0
-                    if abs(change) >= settings.MOMENTUM_THRESHOLD:
-                        signals.append(Signal(symbol, curr, change))
+                    baseline, current = bars[0]["c"], bars[-1]["c"]
+                    change = (current - baseline) / baseline if baseline else 0
+                    threshold = threshold_for(symbol,
+                                              fallback=settings.MOMENTUM_THRESHOLD)
+                    if abs(change) >= threshold:
+                        log.info("Signal: %s moved %+.2f%% over lookback "
+                                 "(threshold %.2f%%) → $%.4f",
+                                 symbol, change * 100, threshold * 100, current)
+                        signals.append(Signal(symbol, current, change))
                 except Exception as e:
                     log.warning("signal fetch failed for %s: %s", symbol, e)
     except Exception as e:

@@ -1,50 +1,62 @@
 """
-Market Simulator — Phase 0
-FastAPI server that exposes a synthetic OHLCV feed in Alpaca API format.
-Swap MARKET_SIM_URL for Alpaca's real endpoint in Phase 2; agent code is unchanged.
+Market Data Service — Phase 2.3
+FastAPI server that proxies Yahoo Finance data in Alpaca API format.
 
-Endpoints (Alpaca-compatible):
+Endpoints (Alpaca-compatible, identical shape to Phase 2.2):
   GET /v2/stocks/{symbol}/bars
   GET /v2/stocks/{symbol}/quotes/latest
-  GET /v2/stocks/snapshots?symbols=SYN-A,SYN-B
+  GET /v2/stocks/snapshots?symbols=AAPL,NVDA
   GET /health
 """
+import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Query
 
 # Allow running directly: python main.py
 sys.path.insert(0, os.path.dirname(__file__))
-from gbm import GBMEngine
+from yahoo import YahooEngine  # noqa: E402
 
-# ── Asset universe ────────────────────────────────────────────────────────────
-#  Each asset has a distinct risk/return profile so the Manager can observe
-#  different behaviour patterns in Phase 0.
-ASSET_CONFIGS: dict[str, dict] = {
-    "SYN-A": {"S0": 100.0, "mu": 0.08, "sigma": 0.20, "seed": 1},  # stable blue-chip
-    "SYN-B": {"S0":  50.0, "mu": 0.14, "sigma": 0.38, "seed": 2},  # high-growth, volatile
-    "SYN-C": {"S0": 200.0, "mu": 0.05, "sigma": 0.13, "seed": 3},  # low-vol bond proxy
-    "SYN-D": {"S0":  75.0, "mu": 0.18, "sigma": 0.50, "seed": 4},  # speculative
-    "SYN-E": {"S0":  30.0, "mu": 0.10, "sigma": 0.25, "seed": 5},  # mid-vol
-}
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+log = logging.getLogger("market_sim")
 
-engines: dict[str, GBMEngine] = {}
+
+def _load_universe() -> list[str]:
+    """Read ASSETS env var; fall back to the synthetic trio for dev safety."""
+    raw = os.getenv("ASSETS", "").strip()
+    if not raw:
+        log.warning("ASSETS env empty — falling back to SYN-A,SYN-B,SYN-C")
+        return ["SYN-A", "SYN-B", "SYN-C"]
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+engines: dict[str, YahooEngine] = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Spin up engines and pre-generate 200 bars of history on startup
-    for symbol, cfg in ASSET_CONFIGS.items():
-        eng = GBMEngine(symbol=symbol, **cfg)
-        eng.advance(200)
-        engines[symbol] = eng
-        print(f"  {symbol}: ${eng.current_price:.2f} ({len(eng._closes)-1} bars pre-generated)")
-    yield  # app runs
-    # (cleanup on shutdown if needed)
+    universe = _load_universe()
+    log.info("Initialising %d engines: %s", len(universe), universe)
+    for symbol in universe:
+        engines[symbol.upper()] = YahooEngine(symbol)
+    # Warm up the cache for each symbol (sequential — <1s per ticker typical)
+    for sym, eng in engines.items():
+        try:
+            p = eng.current_price
+            stale = "stale" if eng.is_stale else "live"
+            log.info("  %s: %.4f (%s)", sym, p, stale)
+        except Exception as exc:
+            log.warning("  %s: warm-up failed (%s)", sym, exc)
+    yield
+    log.info("Shutting down market data service")
 
 
-app = FastAPI(title="Investment Fund — Market Simulator", lifespan=lifespan)
+app = FastAPI(title="Investment Fund — Market Data (Yahoo)", lifespan=lifespan)
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -55,64 +67,47 @@ def get_bars(
     timeframe: str = "1Min",
     limit: int = Query(default=30, le=500),
 ):
-    """
-    Return OHLCV bars.  Alpaca schema: { bars: [...], symbol, next_page_token }.
-    Calling this endpoint advances the price by one bar (real-time simulation).
-    """
-    symbol = symbol.upper()
-    if symbol not in engines:
-        raise HTTPException(404, f"Unknown symbol '{symbol}'. Available: {list(engines)}")
-
-    engines[symbol].advance(1)   # tick forward
-    bars = engines[symbol].get_bars(limit=limit)
-
-    return {"bars": bars, "symbol": symbol, "next_page_token": None}
+    """Alpaca-schema bars, served from the TTL cache."""
+    sym = symbol.upper()
+    if sym not in engines:
+        raise HTTPException(404, f"Unknown symbol '{sym}'. "
+                                 f"Available: {sorted(engines)}")
+    bars = engines[sym].get_bars(limit=limit)
+    return {"bars": bars, "symbol": sym, "next_page_token": None}
 
 
 @app.get("/v2/stocks/{symbol}/quotes/latest")
 def get_latest_quote(symbol: str):
-    """
-    Return latest bid/ask.  Alpaca schema: { quote: { ap, bp, as, bs, t } }.
-    1 bp spread (realistic for liquid synthetic assets).
-    """
-    symbol = symbol.upper()
-    if symbol not in engines:
-        raise HTTPException(404, f"Unknown symbol '{symbol}'")
-
-    price = engines[symbol].current_price
-    spread = price * 0.0001          # 1 bp
-
-    return {
-        "quote": {
-            "ap": round(price + spread, 4),    # ask price
-            "bp": round(price - spread, 4),    # bid price
-            "as": 500,                          # ask size
-            "bs": 500,                          # bid size
-            "t":  engines[symbol].current_time.isoformat() + "Z",
-        },
-        "symbol": symbol,
-    }
+    """Alpaca-schema quote. Includes `stale` flag when market closed."""
+    sym = symbol.upper()
+    if sym not in engines:
+        raise HTTPException(404, f"Unknown symbol '{sym}'")
+    q = engines[sym].get_latest_quote()
+    return {"quote": q, "symbol": sym}
 
 
 @app.get("/v2/stocks/snapshots")
-def get_snapshots(symbols: str = Query(..., description="Comma-separated symbols")):
-    """
-    Multi-symbol snapshot.  Alpaca schema used by momentum scanner.
-    """
+def get_snapshots(symbols: str = Query(...,
+                  description="Comma-separated symbols")):
+    """Multi-symbol snapshot for the momentum scanner."""
     result = {}
     for sym in [s.strip().upper() for s in symbols.split(",")]:
         if sym not in engines:
             continue
         eng = engines[sym]
-        price = eng.current_price
-        pct = eng.pct_change(lookback=60)
+        bars = eng.get_bars(limit=65)
+        if len(bars) < 2:
+            continue
+        current, baseline = bars[-1]["c"], bars[0]["c"]
+        pct = (current - baseline) / baseline if baseline else 0.0
         result[sym] = {
-            "latestTrade": {"p": round(price, 4)},
+            "latestTrade": {"p": round(current, 4)},
             "dailyBar": {
-                "c":  round(price, 4),
-                "pc": round(price / (1 + pct), 4) if pct != -1 else price,
+                "c":  round(current, 4),
+                "pc": round(baseline, 4),
             },
-            "pct_change_1h": round(pct * 100, 3),
+            "pct_change_lookback": round(pct * 100, 3),
+            "stale": eng.is_stale,
         }
     return result
 
@@ -121,8 +116,12 @@ def get_snapshots(symbols: str = Query(..., description="Comma-separated symbols
 def health():
     return {
         "status": "ok",
+        "provider": "yahoo",
         "assets": {
-            sym: {"price": round(eng.current_price, 2), "bars": len(eng._closes) - 1}
+            sym: {
+                "price": round(eng.current_price, 4),
+                "stale": eng.is_stale,
+            }
             for sym, eng in engines.items()
         },
     }

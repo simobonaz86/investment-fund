@@ -30,7 +30,12 @@ from fund.reports import generator  # noqa: E402
 
 
 def reset():
-    Path(os.environ["DB_PATH"]).unlink(missing_ok=True)
+    db_path = Path(os.environ["DB_PATH"])
+    # SQLite WAL-mode leaves -wal and -shm sidecar files that survive unlink.
+    # Clean them too so state doesn't leak across tests.
+    for p in (db_path, db_path.with_suffix(db_path.suffix + "-wal"),
+              db_path.with_suffix(db_path.suffix + "-shm")):
+        p.unlink(missing_ok=True)
     db.init_db()
 
 

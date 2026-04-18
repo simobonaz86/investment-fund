@@ -2,6 +2,7 @@ services:
   market_sim:
     build: ./market_sim
     ports: ["8001:8001"]
+    env_file: .env
     restart: unless-stopped
 
   fund:
